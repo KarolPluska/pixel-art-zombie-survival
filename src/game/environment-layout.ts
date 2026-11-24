@@ -289,8 +289,11 @@ export function populateEnvironment(f: FloorData) {
       const gate = shift(front, heading), back = shift(gate, heading);
       const inlet = shift(front, heading, -1), approach = shift(inlet, heading, -1), other = shift(back, heading);
       if (tile(gate) !== Tile.Wall || reserved.has(idx(gate)) || ![inlet, approach, back, other].every(free)) continue;
+      if (f.doors.some((d) => Math.abs(d.x - gate.x) + Math.abs(d.y - gate.y) <= 3)) continue;
       const next = roomAt(back);
       if (!next || next === r || roomsUsed.has(next.id) || roomAt(other) !== next || roomAt(inlet) !== r) continue;
+      // Don't carve a shortcut straight next to an existing open door between the same pair of rooms
+      if (f.doors.some((d) => d.rooms && ((d.rooms[0] === r.id && d.rooms[1] === next.id) || (d.rooms[0] === next.id && d.rooms[1] === r.id)))) continue;
       const detour = astar(f.w, f.h, approach.x, approach.y, other.x, other.y, canPass);
       if (!detour || detour.length < 14) continue;
       const cells = [inlet, front];

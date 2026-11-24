@@ -11,6 +11,35 @@ npm run dev
 
 `npm run build` przygotowuje wersję produkcyjną (pojedynczy plik `dist/index.html` z wbudowanymi grafikami, fontami i kodem). Muzyka powstaje lokalnie w przeglądarce.
 
+## Dopracowany generator poziomów (mieszkania, drzwi, zestawy wnętrz i patrole korytarzy)
+
+### Wykryte źródła problemów (stan bazowy na 64 piętrach / 32 seedy)
+
+- **Drzwi obok siebie i duplikaty:** `buildVariedFloor` łączył luźno upakowane pokoje niezależnie dla każdego prostokąta (`ordered[0]` w narożniku + drugie drzwi z `dist >= 3`), co dawało **364 duplikaty** między tą samą parą przestrzeni, **392 pokoje** z dwoma wyjściami do korytarza i **1015 par bliskich drzwi** w obrębie tego samego pokoju (`dist ≤ 4`).
+- **Brak struktury mieszkań:** pokoje nie należały do lokali ani nie miały komunikacji wewnętrznej (`0` przedpokojów); funkcje dobierano losowo niezależnie dla każdego pokoju.
+- **Przypadkowe wnętrza i urządzenia:** meble ustawiano prostymi kotwicami bez relacji między sobą, a `installTacticalContent` dokładał losowo wolnostojące radia (**40/96** na środku pokoju) i telewizory (**33/237** bez ściany).
+- **Za puste korytarze i zepsute patrole:** losowe spawny dawały średnio tylko **3,91** zombie na korytarzach w Piwnicy (1 piętro z **0**!) i **5,34** na Piętrze I; paski korytarzy miały `h = 1`, przez co **61/296** patroli kierowało się na pole w ścianie (`y + 1`), a limit populacji `24` nie zostawiał zapasu nad większą obsadą startową.
+
+### Wdrożone zmiany
+
+- **Architektura mieszkań (`src/game/apartment-layout.ts`):** podział wolnych kwartałów w obrębie wszystkich 7 rodzin korytarzy na czytelne lokale z hierarchią `KORYTARZ → wejście → PRZEDPOKÓJ → pokoje dzienne/prywatne → ślepe ŁAZIENKA/SCHOWEK` i wspólnym pionem wodnym (kuchnia przylega do łazienki w ok. **98%** mieszkań z obydwoma pokojami). Rodziny: `kawalerka`, `dwupokojowe`, `rodzinne`, `narozne`, `wydluzone`, `przebudowane` (z przebiciem ścian między częściami) oraz `zaplecze` i `uslugowy` dla kondygnacji technicznych i parteru. Domyślnie jedno główne wejście; drugie wyjście (`bypass`) wyłącznie gdy prowadzi na istotnie odległy odcinek korytarza (obejście ≥ 10 pól) lub przez przebicie między lokalami.
+- **Planowanie i lokalna naprawa drzwi:** połączenia wynikają z grafu lokalu (max 1 drzwi na parę pomieszczeń), z wyśrodkowanym osadzeniem i odstępem adaptacyjnym (uzasadnione wyjątki: dystrybucja z `PRZEDPOKÓJ` oraz drzwi sąsiednich mieszkań na małym podeście). Osobny etap napraw (`auditAndRepairDoors`, `repairThresholdsAndProps`) usuwa duplikaty, przesuwa bliskie pary po wspólnej granicy i pilnuje drożności progów po obu stronach.
+- **Spójne zestawy wyposażenia i kontrolowane zniszczenia:** każdy typ pomieszczenia otrzymuje dopasowany do wymiarów i orientacji 3/4 zestaw mebli (salon: sofa–dywan–stolik–fotel–TV naprzeciwko–regał–kwiat; kuchnia: ciąg roboczy lodówka–blat–kuchenka–zlew + strefa dojścia; sypialnia: łóżko–szafa z wolnym frontem–biurko/regał; łazienka: WC–umywalka–apteczka–wanna/prysznic–pralka; przedpokój: wyłącznie obrzeża, wolny środek; schowek/warsztat/kotłownia/pralnia: ciągi przyścienne z dostępem). Telewizory i radia montowane są przy ścianach w relacji do mebli. Zniszczenia (wyłomy między lokalami, celowe barykady, gruz, kałuże, osmalenia, szczegóły kontekstowe) dodawane są po zbudowaniu logicznego mieszkania, a skróty parowe omijają sąsiedztwo drzwi.
+- **Strefowa obsada korytarzy i zsynchronizowane patrole (`src/game/corridor-patrol.ts`, `src/game/engine.ts`):** sieć publiczna dzielona jest na strefy (hole, skrzyżowania, podesty, odcinki ~11–14 pól). Początkowa obsada trafia w **57–70%** kwalifikujących się stref (Piwnica śr. **12,8**, Piętro I śr. **16,0**, Piętra V–VII do **25,0** zombie na korytarzach — głównie patrole solo oraz 2–4 grupy po 2–4 zombie w większych strefach i na głównej trasie), z oddzielną pulą pokojów, relokacją przy odrzuceniach, najdłuższym pustym odcinkiem max 2 strefy oraz gwarantowanym zapasem **8 miejsc** na późniejsze posiłki (`populationMax = 48`). Patrole podążają zweryfikowanymi wielostrefowymi trasami korytarzowymi A*, grupy utrzymują zsynchronizowane tempo z naturalnym odstępem, zatrzymują się i rozglądają na skrzyżowaniach oraz aktualizują ścieżkę przy zmianie przeszkód; w razie hałasu zombie przechodzą do mieszkań wyważając nieoznaczone drzwi.
+- **Wieloaspektowy audyt i diagnostyka (`src/game/layout-quality.ts`, `scripts/audit-layouts.mjs`, `scripts/check-generator-quality.mjs`):** ocena dostępności, logiki mieszkań, drzwi, wyposażenia i obsady korytarzy. Rzut diagnostyczny (`public/layout-comparison.html`) pokazuje funkcje pokoi, granice mieszkań, role drzwi, strefy dojścia, pozycje zombie i realne trasy patroli A* na 32 seedach. Zachowano pełną zgodność wsteczną `generatorVersion === 1` dla starszych zapisów.
+
+### Sprawdzenia generatora (rzeczywiście wykonane)
+
+- `npx tsc --noEmit`: ✅ brak błędów TypeScript.
+- `node scripts/check-layout.mjs`: ✅ 128 nowych pięter, 32 stare mapy odtworzone co do kafelka, 7 rodzin, 32 unikalne starty, 32 topologie korytarzy, 0 fallbacków.
+- `node scripts/check-equipment.mjs`: ✅ 704 piętra z osiągalnym, kontekstowym łupem (bez skrzyń w pokojach mieszkalnych, bronie odkrywcze i klucze na miejscu).
+- `node scripts/check-environment.mjs`: ✅ 352 piętra z bezpiecznymi trasami i 112 skrótami parowymi, warianty zagrożeń i stanów.
+- `node scripts/check-vertical.mjs`: ✅ 264 piętra (24 pełne budynki), spójne szyby windy/Klatki B/pionu, wszystkie 6 scenariuszy i zapis v3.
+- `node scripts/check-generator-quality.mjs`: ✅ 192 piętra (32 seedy × piętra 0, 1, 2, 4, 6, 8) — `0` duplikatów drzwi, `0` bliskich drzwi w jednym pokoju, `0` zablokowanych progów, `100%` szaf/radia/TV/łupu osiągalnych i przyściennych, `0` niedoborów obsady korytarzy, `0` błędnych patroli, min. zapas na posiłki `8`; 60-sekundowa symulacja patroli na 8 piętrach (`100%` aktywnego ruchu ≥10 pól, `100%` przekraczania stref, `100%` pozostania na korytarzach, spójność wszystkich grup i przeplanowanie po dynamicznej przeszkodzie); 10-etapowy playtest integracyjny na 6 różnych układach (w tym realne obejście patrolu, szafa/radio/TV/łup, wyważenie drzwi przez zombie po hałasie i spójne przejście na następne piętro).
+- `node scripts/audit-layouts.mjs`: ✅ zaktualizowano `reports/layout-metrics.json` i `public/layout-comparison.html` (0 fallbacków, 0 odrzuceń na piętrze 0).
+- `npm run build`: ✅ poprawna produkcyjna paczka `dist/index.html`.
+- **Nie sprawdzono w tej iteracji:** uruchomienia testów Playwright w realnym Chromium (brak zainstalowanej przeglądarki w środowisku), długiej ręcznej rozgrywki przez 10 pięter, testów w Safari/Firefoksie ani na fizycznym telefonie.
+
 ## Scenariusze pięter i przemieszczanie między kondygnacjami
 
 Piętra przeplatają rozbudowane zadania (3–5 etapów) ze spokojniejszymi kondygnacjami (Piwnica, Piętro III, Piętro VI, Piętro VIII). Każdy scenariusz w obrębie wyprawy losowany jest deterministycznie od `seed` (bez powtórek na sąsiednich piętrach) i ma działające alternatywy:

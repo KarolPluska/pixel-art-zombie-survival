@@ -5,8 +5,22 @@ import { DISCOVERIES } from "./inventory";
 import { populateEnvironment, validateEnvironment } from "./environment-layout";
 import { installVerticalQuests, installVerticalRoutes } from "./vertical-layout";
 import { installTacticalContent } from "./tactical-layout";
+import {
+  applyIntentionalDamage,
+  auditAndRepairDoors,
+  buildPlannedApartments,
+  furnishCorridorEdges,
+  furnishRoomSet,
+  ZONE_LABEL,
+  type FloorBuild,
+  type Zone as PlanZone,
+} from "./apartment-layout";
+import { populateFloorZombies } from "./corridor-patrol";
+import { evaluateFloorQuality, repairThresholdsAndProps } from "./layout-quality";
 import type {
+  ApartmentInfo,
   DecalSpawn,
+  PropAccessPoint,
   DoorInfo,
   FloorData,
   LightFixture,
@@ -25,34 +39,9 @@ type Rng = ReturnType<typeof makeRng>;
 const idx = (x: number, y: number) => y * W + x;
 const inb = (x: number, y: number) => x >= 0 && y >= 0 && x < W && y < H;
 
-type Zone =
-  | "living"
-  | "kitchen"
-  | "bath"
-  | "bedroom"
-  | "corridor"
-  | "stair"
-  | "laundry"
-  | "boiler"
-  | "storage"
-  | "office"
-  | "nursery"
-  | "workshop";
+type Zone = PlanZone;
 
-const ZONE_NAME: Record<Zone, string> = {
-  living: "SALON",
-  kitchen: "KUCHNIA",
-  bath: "ŁAZIENKA",
-  bedroom: "SYPIALNIA",
-  corridor: "KORYTARZ",
-  stair: "KLATKA SCHODOWA",
-  laundry: "PRALNIA",
-  boiler: "KOTŁOWNIA",
-  storage: "SCHOWEK",
-  office: "LOKAL UŻYTKOWY",
-  nursery: "POKÓJ DZIECIĘCY",
-  workshop: "WARSZTAT",
-};
+const ZONE_NAME: Record<Zone, string> = ZONE_LABEL;
 
 const PASSABLE = new Set<number>([Tile.Floor, Tile.Rubble, Tile.Puddle, Tile.StairsUp, Tile.StairsDown, Tile.Door, Tile.DoorOpen]);
 
@@ -83,6 +72,9 @@ interface Build {
   survivors: FloorData["survivors"];
   decals: DecalSpawn[];
   lights: LightFixture[];
+  apartments: ApartmentInfo[];
+  propAccess: PropAccessPoint[];
+  repairsApplied: number;
 }
 
 function newBuild(): Build {
@@ -105,6 +97,9 @@ function newBuild(): Build {
     survivors: [],
     decals: [],
     lights: [],
+    apartments: [],
+    propAccess: [],
+    repairsApplied: 0,
   };
 }
 
@@ -312,6 +307,11 @@ const FURNITURE: Record<Zone, Spec[]> = {
     { kind: "table", w: 1, h: 1 },
     { kind: "locker", w: 1, h: 1 },
     { kind: "crate", w: 1, h: 1 },
+  ],
+  hall: [
+    { kind: "wardrobe", w: 1, h: 1 },
+    { kind: "bench", w: 2, h: 1 },
+    { kind: "radiator", w: 1, h: 1 },
   ],
   corridor: [],
   stair: [],
@@ -1066,95 +1066,274 @@ function buildVariedFloor(index: number, seed: number, buildingSeed: number): Fl
     r.lit=true;
   }
 
-  // Rooms are packed into the spaces left by the actual connected circulation graph.
-  const roomsAdded: Room[]=[];
-  const canRoom=(x:number,y:number,w:number,h:number)=>{
-    if(x<6||y<5||x+w>W-6||y+h>H-5)return false;
-    for(let yy=y-1;yy<=y+h;yy++)for(let xx=x-1;xx<=x+w;xx++) if(b.tiles[idx(xx,yy)]!==Tile.Wall||reserved[idx(xx,yy)]||isVoid(xx,yy))return false;
-    for(let yy=y;yy<y+h;yy++) if(PASSABLE.has(b.tiles[idx(x-2,yy)])||PASSABLE.has(b.tiles[idx(x+w+1,yy)]))return true;
-    for(let xx=x;xx<x+w;xx++) if(PASSABLE.has(b.tiles[idx(xx,y-2)])||PASSABLE.has(b.tiles[idx(xx,y+h+1)]))return true;
-    return false;
-  };
-  for(let attempts=0;attempts<1500&&roomsAdded.length<55;attempts++){
-    const w=4+rng.int(family===2?9:family===0?4:7),h=3+rng.int(family===4?8:7);
-    const x=6+rng.int(W-12-w),y=5+rng.int(H-10-h);
-    if(!canRoom(x,y,w,h))continue;
-    const zone=service?rng.pick(serviceZones(rng)):rng.pick(apartmentZones(rng,meta.decay));
-    const r=addRoom(b,x,y,w,h,zone,"normal",meta.decay,service,rng);
-    roomsAdded.push(r);
-  }
-  if(roomsAdded.length<10){lastLayoutFailure=`too few rooms (${roomsAdded.length})`;return null;}
-
-  // Join rooms to corridors or neighbouring rooms. Every room must have an entrance.
-  for(const r of roomsAdded){
-    const options: {x:number;y:number; corridor:boolean}[]=[];
-    for(let y=r.y;y<r.y+r.h;y++)for(const side of [-1,1]){
-      const x=side<0?r.x-1:r.x+r.w;
-      const farX=x+side;
-      if(b.tiles[idx(x,y)]===Tile.Wall && PASSABLE.has(b.tiles[idx(farX,y)])) options.push({x,y,corridor:b.roomZones[b.roomOf[idx(farX,y)]]==="KORYTARZ"});
-    }
-    for(let x=r.x;x<r.x+r.w;x++)for(const side of [-1,1]){
-      const y=side<0?r.y-1:r.y+r.h,farY=y+side;
-      if(b.tiles[idx(x,y)]===Tile.Wall && PASSABLE.has(b.tiles[idx(x,farY)])) options.push({x,y,corridor:b.roomZones[b.roomOf[idx(x,farY)]]==="KORYTARZ"});
-    }
-    const ordered=options.sort((a,c)=>Number(c.corridor)-Number(a.corridor)||a.x-c.x||a.y-c.y);
-    if(ordered[0]) addDoor(b,ordered[0].x,ordered[0].y,false);
-    if(ordered.length>1 && rng.chance(family===4?0.85:0.5)) {
-      const alt=ordered.find((o)=>distCell(o,ordered[0])>=3);
-      if(alt) addDoor(b,alt.x,alt.y,false);
-    }
+  // 1) Pack planned functional apartments & technical suites with purposeful room connections and clean doors.
+  const fb = b as unknown as FloorBuild;
+  const roomsAdded = buildPlannedApartments(fb, index, family, meta.decay, reserved, isVoid, rng);
+  if (roomsAdded.length < 10 || b.apartments.length < 4) {
+    lastLayoutFailure = `too few apartment rooms (${roomsAdded.length}/${b.apartments.length})`;
+    return null;
   }
 
-  // Reserve one real corridor-connected workshop and storage room for contextual mandatory loot.
-  const firstWorkshop=roomsAdded.find(r=>b.roomZones[r.id]==="WARSZTAT"||b.roomZones[r.id]==="SCHOWEK");
-  if(!firstWorkshop) {b.roomZones[roomsAdded[0].id]="WARSZTAT";b.zones[roomsAdded[0].id]="workshop";}
-  const bedroom=roomsAdded.find(r=>b.zones[r.id]==="bedroom"&&r.w>=5);
-  if(!bedroom){const r=roomsAdded[roomsAdded.length-1];b.zones[r.id]="bedroom";b.roomZones[r.id]="SYPIALNIA";}
-  const corridor=b.rooms.find(r=>b.roomZones[r.id]==="KORYTARZ"&&r.w>=4);
-  if(!corridor){lastLayoutFailure="no long corridor";return null;}
-  // The actual start may be a room, work area, lobby or stair landing, independent of exit.
-  let startRoom=stairRooms[1]??roomsAdded[profile.start%roomsAdded.length];
-  if(index===0){
-    const pool=roomsAdded.filter(r=>r.w>=5&&r.h>=4);
-    if(pool.length)startRoom=pool[profile.start%pool.length];
-    startRoom.role="start";
-    startRoom.lit=true;
-    b.zones[startRoom.id]=rng.pick(["workshop","storage","office","living","bedroom"]);
-    b.roomZones[startRoom.id]=ZONE_NAME[b.zones[startRoom.id]];
+  // 2) Audit & locally repair all door joints before any furnishing is placed.
+  auditAndRepairDoors(fb);
+
+  const corridor = b.rooms.find((r) => b.roomZones[r.id] === "KORYTARZ" && r.w >= 4);
+  if (!corridor) {
+    lastLayoutFailure = "no long corridor";
+    return null;
   }
-  // Furnish only after all doors and passages exist.
-  for(const r of b.rooms) if(r.w>=3&&r.h>=3 && b.zones[r.id]!=="corridor")furnishRoom(b,r,b.zones[r.id],meta.decay);
-  addSurfaceDetails(b,dressing,index,meta.decay);
-  if(!stockFloor(b,index,index>0&&index%2===1,startRoom)){lastLayoutFailure="mandatory loot could not be placed";return null;}
-  if(index===0){
-    const host=b.props.find(p=>p.loot==="hatchet");
-    if(!host){lastLayoutFailure="no start weapon";return null;}
+
+  // 3) Choose a natural, corridor-linked starting room on floor 0 (keeping its real functional identity!)
+  let startRoom = stairRooms[1] ?? roomsAdded[profile.start % roomsAdded.length];
+  if (index === 0) {
+    const entryPool = b.apartments
+      .map((apt) => {
+        const ed = b.doors.find((d) => d.x === apt.entryDoor.x && d.y === apt.entryDoor.y);
+        const rm = ed?.rooms ? b.rooms[ed.rooms[0]] : b.rooms[apt.roomIds[0]];
+        return rm;
+      })
+      .filter((r): r is Room => !!r && r.w >= 4 && r.h >= 4 && distCell({ x: r.x + Math.floor(r.w / 2), y: r.y + Math.floor(r.h / 2) }, up) >= 12);
+    const pool = entryPool.length
+      ? entryPool
+      : roomsAdded.filter((r) => r.w >= 4 && r.h >= 4);
+    if (pool.length) startRoom = pool[profile.start % pool.length];
+    startRoom.role = "start";
+    startRoom.lit = true;
   }
+
+  // Subtle clean stairwell fixtures matching start/exit roles (keep stair tile clear)
+  if (stairRooms[0]) {
+    const sr = stairRooms[0];
+    placeAnchored(b, sr, { kind: "extinguisher", w: 1, h: 1 }, 1, 0);
+    if (sr.w >= 5) placeAnchored(b, sr, { kind: "board", w: 2, h: 1 }, 0, 0);
+  }
+  if (stairRooms[1]) {
+    const sr = stairRooms[1];
+    const med = placeAnchored(b, sr, { kind: "medbox", w: 1, h: 1 }, 0, 0.8);
+    if (med) { med.loot = "med"; med.label = "Apteczka ścienna"; }
+    placeAnchored(b, sr, { kind: "bench", w: 2, h: 1 }, 0, 0);
+  }
+
+  // 4) Compose every interior room as a coordinated functional furniture set aligned to walls & doorways.
+  for (const r of b.rooms) {
+    if (r.role === "stairs" || b.zones[r.id] === "corridor" || b.zones[r.id] === "stair") continue;
+    furnishRoomSet(fb, r, b.zones[r.id], meta.decay, dressing);
+  }
+  // Sparse, unobstructed fixtures on wide public corridors
+  furnishCorridorEdges(fb, service, dressing);
+
+  // 5) Contextual floor stocking: guaranteed discovery weapon, wall-flush corridor key locker, logical room supplies!
+  const locked = index > 0 && index % 2 === 1;
+  if (!stockVariedFloor(b, index, locked, startRoom, up, dressing)) {
+    lastLayoutFailure = "mandatory loot could not be placed";
+    return null;
+  }
+  if (index === 0 && !b.props.some((p) => p.loot === "hatchet")) {
+    lastLayoutFailure = "no start weapon";
+    return null;
+  }
+
+  // 6) Layer intentional damage, cross-apartment wall fractures, floor story details, leaks & scorch AFTER clean room layout!
+  applyIntentionalDamage(fb, index, meta.decay, dressing);
+
   sealRooms(b);
-  paintWallBorders(b,meta.decay,service);
-  placeWindows(b,dressing,meta.decay);
-  buildLights(b,dressing,meta.decay,[]);
-  for(let y=7;y<H-7;y++)for(let x=8;x<W-8;x++){
-    const rid=b.roomOf[idx(x,y)];
-    if(rid>=0&&b.roomZones[rid]==="KORYTARZ"&&b.tiles[idx(x,y)]===Tile.Floor&&(x*7+y*11+seed)%47===0)
-      b.lights.push(makeLight(x,y,"fluor",dressing.chance(.28+meta.decay*.35),rid,4.6));
+  paintWallBorders(b, meta.decay, service);
+  placeWindows(b, dressing, meta.decay);
+  buildLights(b, dressing, meta.decay, []);
+  for (let y = 7; y < H - 7; y++) {
+    for (let x = 8; x < W - 8; x++) {
+      const rid = b.roomOf[idx(x, y)];
+      if (rid >= 0 && b.roomZones[rid] === "KORYTARZ" && b.tiles[idx(x, y)] === Tile.Floor && (x * 7 + y * 11 + seed) % 47 === 0) {
+        b.lights.push(makeLight(x, y, "fluor", dressing.chance(0.28 + meta.decay * 0.35), rid, 4.6));
+      }
+    }
   }
   b.occ.fill(0);
-  for(const p of b.props)if(p.solid)for(let y=p.y;y<p.y+p.h;y++)for(let x=p.x;x<p.x+p.w;x++)b.occ[idx(x,y)]=1;
-  carveExtraBreaches(b,dressing,meta.decay);
-  spawnCorpses(b,dressing,index);
-  spawnSurvivors(b,dressing,index,startRoom);
-  const spawns=spawnZombies(b,dressing,index,startRoom);
-  const startCell = index===0 ? Array.from({length:startRoom.w*startRoom.h},(_,n)=>({x:startRoom.x+n%startRoom.w,y:startRoom.y+Math.floor(n/startRoom.w)}))
-    .filter(p=>b.tiles[idx(p.x,p.y)]===Tile.Floor&&!b.occ[idx(p.x,p.y)])
-    .sort((a,c)=>distCell(a,{x:startRoom.x+startRoom.w/2,y:startRoom.y+startRoom.h/2})-distCell(c,{x:startRoom.x+startRoom.w/2,y:startRoom.y+startRoom.h/2}))[0] : down!;
-  if(!startCell){lastLayoutFailure="start occupied by furniture";return null;}
-  return {index,theme:meta.theme,name:meta.name,sub:`${meta.sub} · ${LAYOUT_FAMILIES[family]}`,seed,w:W,h:H,
-    tiles:b.tiles,floorStyle:b.floorStyle,wallStyle:b.wallStyle,rooms:b.rooms,roomZones:b.roomZones,roomOf:b.roomOf,
-    props:b.props,doors:b.doors,zombies:spawns,windows:b.windows,decals:b.decals,wallDecals:b.wallDecals,
-    breaches:b.breaches,corpses:b.corpses,survivors:b.survivors,lights:b.lights,
-    playerStart:{x:(startCell.x+.5)*TILE,y:(startCell.y+.5)*TILE},stairsUp:up,stairsDown:index>0?down:null,
-    locked:index>0&&index%2===1,keyPropId:b.props.find(p=>p.loot==="key")?.id??null,flare:null};
+  for (const p of b.props) if (p.solid) for (let y = p.y; y < p.y + p.h; y++) for (let x = p.x; x < p.x + p.w; x++) b.occ[idx(x, y)] = 1;
+  spawnCorpses(b, dressing, index);
+  spawnSurvivors(b, dressing, index, startRoom);
+
+  const startCell =
+    index === 0
+      ? Array.from({ length: startRoom.w * startRoom.h }, (_, n) => ({
+          x: startRoom.x + (n % startRoom.w),
+          y: startRoom.y + Math.floor(n / startRoom.w),
+        }))
+          .filter(
+            (p) =>
+              b.tiles[idx(p.x, p.y)] === Tile.Floor &&
+              !b.occ[idx(p.x, p.y)] &&
+              !b.doors.some((d) => Math.abs(d.x - p.x) + Math.abs(d.y - p.y) <= 1),
+          )
+          .sort(
+            (a, c) =>
+              distCell(a, { x: startRoom.x + startRoom.w / 2, y: startRoom.y + startRoom.h / 2 }) -
+              distCell(c, { x: startRoom.x + startRoom.w / 2, y: startRoom.y + startRoom.h / 2 }),
+          )[0] ??
+        Array.from({ length: startRoom.w * startRoom.h }, (_, n) => ({
+          x: startRoom.x + (n % startRoom.w),
+          y: startRoom.y + Math.floor(n / startRoom.w),
+        })).find((p) => b.tiles[idx(p.x, p.y)] === Tile.Floor && !b.occ[idx(p.x, p.y)])
+      : down!;
+  if (!startCell) {
+    lastLayoutFailure = "start occupied by furniture";
+    return null;
+  }
+
+  return {
+    index,
+    theme: meta.theme,
+    name: meta.name,
+    sub: `${meta.sub} · ${LAYOUT_FAMILIES[family]}`,
+    seed,
+    w: W,
+    h: H,
+    tiles: b.tiles,
+    floorStyle: b.floorStyle,
+    wallStyle: b.wallStyle,
+    rooms: b.rooms,
+    roomZones: b.roomZones,
+    roomOf: b.roomOf,
+    props: b.props,
+    doors: b.doors,
+    zombies: [],
+    windows: b.windows,
+    decals: b.decals,
+    wallDecals: b.wallDecals,
+    breaches: b.breaches,
+    corpses: b.corpses,
+    survivors: b.survivors,
+    lights: b.lights,
+    playerStart: { x: (startCell.x + 0.5) * TILE, y: (startCell.y + 0.5) * TILE },
+    stairsUp: up,
+    stairsDown: index > 0 ? down : null,
+    locked,
+    keyPropId: b.props.find((p) => p.loot === "key")?.id ?? null,
+    flare: null,
+    apartments: b.apartments,
+    propAccess: b.propAccess,
+  };
+}
+
+/** Places mandatory weapons, flush corridor key locker & contextual supplies without disturbing room ergonomics. */
+function stockVariedFloor(b: Build, index: number, locked: boolean, start: Room, exitUp: Cell, rng: Rng): boolean {
+  const zoneOf = (p: Prop) => b.zones[b.roomOf[idx(p.x, p.y)]];
+  const usedRooms = new Set<number>();
+  const distribute = (loot: Prop["loot"], kinds: PropKind[], zones: Zone[], count: number, label: string) => {
+    const pool = b.props.filter((p) => !p.loot && kinds.includes(p.kind) && zones.includes(zoneOf(p)));
+    for (let n = 0; n < count; n++) {
+      const targetY = (H * (n + 0.5)) / count;
+      const host = pool
+        .filter((p) => !p.loot && !usedRooms.has(b.roomOf[idx(p.x, p.y)]))
+        .sort((a, c) => Math.abs(a.y - targetY) - Math.abs(c.y - targetY) || a.id - c.id)[0];
+      if (!host) continue;
+      host.loot = loot;
+      host.label = label;
+      if (loot === "note") host.note = NOTES[(index + n) % NOTES.length];
+      usedRooms.add(b.roomOf[idx(host.x, host.y)]);
+    }
+  };
+
+  // Helper placing one clean wall-anchored prop safely inside a room without blocking any door
+  const addRoomFixture = (r: Room, kind: PropKind, w: number): Prop | undefined => {
+    const hit = placeAnchored(b, r, { kind, w, h: 1 }, 0.85, 0);
+    if (hit) return hit;
+    for (let y = r.y; y < r.y + r.h; y++) {
+      for (let x = r.x; x <= r.x + r.w - w; x++) {
+        const edge = x === r.x || y === r.y || x + w === r.x + r.w || y + 1 === r.y + r.h;
+        if (!edge) continue;
+        let ok = true;
+        for (let xx = x; xx < x + w; xx++) {
+          if (b.tiles[idx(xx, y)] !== Tile.Floor || b.occ[idx(xx, y)]) ok = false;
+          if (b.doors.some((d) => Math.abs(d.x - xx) + Math.abs(d.y - y) <= 1)) ok = false;
+          if (b.tiles[idx(xx, y)] === Tile.StairsDown || b.tiles[idx(xx, y)] === Tile.StairsUp) ok = false;
+        }
+        if (!ok) continue;
+        // Confirm at least one free orthogonal standing cell inside room
+        const hasAccess = N4.some(([dx, dy]) => {
+          const nx = x + dx, ny = y + dy;
+          return nx >= r.x && ny >= r.y && nx < r.x + r.w && ny < r.y + r.h && b.tiles[idx(nx, ny)] === Tile.Floor && !b.occ[idx(nx, ny)];
+        });
+        if (hasAccess) return addProp(b, kind, x, y, w, 1, true);
+      }
+    }
+    return undefined;
+  };
+
+  // Floor discovery weapons (preserved in contextual fixtures!)
+  const weapon = DISCOVERIES[index];
+  if (weapon) {
+    let host: Prop | undefined;
+    if (index === 0) {
+      host =
+        b.props.find((p) => p.kind === "locker" && !p.loot && b.roomOf[idx(p.x, p.y)] === start.id) ??
+        addRoomFixture(start, "locker", 1);
+    } else if (index === 1) {
+      host =
+        b.props.find((p) => p.kind === "desk" && !p.loot && b.roomOf[idx(p.x, p.y)] === start.id) ??
+        addRoomFixture(start, "desk", 2);
+      if (!host) {
+        const office = b.rooms.find((r) => b.zones[r.id] === "office" && r.w >= 4);
+        if (office) host = b.props.find((p) => p.kind === "desk" && !p.loot && b.roomOf[idx(p.x, p.y)] === office.id) ?? addRoomFixture(office, "desk", 2);
+      }
+    } else {
+      host = b.props
+        .filter((p) => p.kind === "wardrobe" && !p.loot && zoneOf(p) === "bedroom")
+        .sort((a, c) => c.y - a.y || a.x - c.x)[0];
+      if (!host) {
+        const bed = b.rooms.find((r) => b.zones[r.id] === "bedroom");
+        if (bed) host = addRoomFixture(bed, "wardrobe", 1);
+      }
+    }
+    if (!host) return false;
+    host.loot = weapon;
+    host.label =
+      index === 0 ? "Szafka warsztatowa" : index === 1 ? "Biurko dozorcy" : index === 4 ? "Szafa myśliwego" : "Szafa sportowca";
+  }
+
+  // Wall-mounted key cabinet flush against a real wide public corridor wall (safe clearance, never blocking passage!)
+  if (locked) {
+    const keySpots: { x: number; y: number; score: number }[] = [];
+    const sc = { x: start.x + Math.floor(start.w / 2), y: start.y + Math.floor(start.h / 2) };
+    for (let y = 7; y < H - 7; y++) {
+      for (let x = 7; x < W - 7; x++) {
+        const i = idx(x, y);
+        const rid = b.roomOf[i];
+        if (rid < 0 || b.roomZones[rid] !== "KORYTARZ" || b.tiles[i] !== Tile.Floor || b.occ[i]) continue;
+        // Must back onto solid wall (north preferred for readability!) and leave wide clear walkthrough
+        const northWall = b.tiles[idx(x, y - 1)] === Tile.Wall;
+        const openSides = N4.filter(([dx, dy]) => {
+          const ni = idx(x + dx, y + dy);
+          return b.tiles[ni] === Tile.Floor && !b.occ[ni] && b.roomOf[ni] >= 0 && b.roomZones[b.roomOf[ni]] === "KORYTARZ";
+        }).length;
+        if (openSides < 3 && !(northWall && b.tiles[idx(x, y + 1)] === Tile.Floor && !b.occ[idx(x, y + 1)] && (b.tiles[idx(x - 1, y + 1)] === Tile.Floor || b.tiles[idx(x + 1, y + 1)] === Tile.Floor))) continue;
+        if (!northWall && !N4.some(([dx, dy]) => b.tiles[idx(x + dx, y + dy)] === Tile.Wall)) continue;
+        if (b.doors.some((d) => Math.abs(d.x - x) + Math.abs(d.y - y) <= 2)) continue;
+        // Keep away from edge facade corridor tracks so passing stays seamless
+        if (b.tiles[idx(x - 1, y)] === Tile.Wall && b.tiles[idx(x + 1, y)] === Tile.Wall) continue;
+        if (b.tiles[idx(x, y - 1)] === Tile.Wall && b.tiles[idx(x, y + 1)] === Tile.Wall) continue;
+        const dStart = Math.abs(x - sc.x) + Math.abs(y - sc.y);
+        const dExit = Math.abs(x - exitUp.x) + Math.abs(y - exitUp.y);
+        if (dStart < 10) continue;
+        const score = (northWall ? 20 : 0) + openSides * 4 + Math.min(35, dStart) * 0.6 + Math.min(30, dExit) * 0.4 + rng() * 6;
+        keySpots.push({ x, y, score });
+      }
+    }
+    keySpots.sort((a, c) => c.score - a.score);
+    const k = keySpots[0];
+    if (!k) return false;
+    const host = addProp(b, "locker", k.x, k.y, 1, 1, true, "key");
+    host.label = "Szafka na klucze";
+    b.propAccess.push({ propId: host.id, kind: "locker", x: k.x, y: k.y, ax: k.x, ay: k.y + 1, role: "loot" });
+  }
+
+  distribute("med", ["medbox"], ["bath", "laundry"], 3, "Apteczka ścienna");
+  distribute("ammo", ["supplycase", "crate"], ["storage", "workshop"], 3, "Kaseta z nabojami");
+  distribute("battery", ["locker", "counter"], ["boiler", "workshop", "kitchen"], 3, "Szuflada z bateriami");
+  if (index >= 4) distribute("shells", ["wardrobe", "locker"], ["bedroom", "storage", "hall"], 2, "Zapas śrutu");
+  if (index >= 6) distribute("bolts", ["wardrobe", "crate"], ["bedroom", "storage"], 2, "Futerał na bełty");
+  distribute("note", ["desk", "bookshelf"], ["living", "bedroom", "office"], 3, "Notatki mieszkańca");
+  return true;
 }
 
 export function diagnoseVariedFloor(index: number, seed: number, buildingSeed: number) {
@@ -1165,10 +1344,18 @@ export function diagnoseVariedFloor(index: number, seed: number, buildingSeed: n
   installVerticalRoutes(floor, buildingSeed);
   populateEnvironment(floor);
   installVerticalQuests(floor, buildingSeed);
-  if (!floor.environment?.features.some(f=>f.kind==="wall")) return "no fragile annex";
-  if (!floor.environment?.features.some(f=>f.kind==="obstruction")) return "no blocked annex";
+  if (!floor.environment?.features.some((f) => f.kind === "wall")) return "no fragile annex";
+  if (!floor.environment?.features.some((f) => f.kind === "obstruction")) return "no blocked annex";
   installTacticalContent(floor);
-  return validateFloor(floor) ?? "ok";
+  const repaired = repairThresholdsAndProps(floor);
+  populateFloorZombies(floor, index, floor.seed);
+  const q = evaluateFloorQuality(floor, repaired);
+  const fatal = validateFloor(floor);
+  if (fatal) return fatal;
+  if (q.duplicateRoomPairDoors > 0) return `duplicate doors (${q.duplicateRoomPairDoors})`;
+  if (q.blockedThresholds > 0) return `blocked thresholds (${q.blockedThresholds})`;
+  if (q.issues.length) return q.issues[0];
+  return "ok";
 }
 
 function carveExtraBreaches(b: Build, rng: Rng, decay: number) {
@@ -1565,6 +1752,13 @@ export function generateFloor(index: number, seed: number, runSeed?: number, gen
       if (index < 10) installVerticalQuests(floor, buildingSeed);
       if (generatorVersion !== 1 && index < 10 && (!floor.environment?.features.some((f) => f.kind === "wall") || !floor.environment?.features.some((f) => f.kind === "obstruction"))) continue;
       installTacticalContent(floor);
+      if (generatorVersion !== 1 && index < 10) {
+        const repaired = repairThresholdsAndProps(floor);
+        populateFloorZombies(floor, index, floor.seed);
+        const q = evaluateFloorQuality(floor, repaired);
+        if (q.duplicateRoomPairDoors > 0 || q.blockedThresholds > 0 || q.closeSameRoomDoors > 0) continue;
+        if (q.wardrobesAccessible < q.wardrobesTotal || q.devicesAccessible < q.devicesTotal) continue;
+      }
       if (!validateFloor(floor)) return floor;
     } catch {
       // kolejna próba z innym ziarnem

@@ -28,6 +28,7 @@ import {
 } from "./vertical-scene";
 import { WEAPONS, assignSlot, copyInventory, discover, isWeapon, starterInventory, type Slots, type WeaponId } from "./inventory";
 import { generateFloor } from "./generate";
+import { buildFallbackCorridorPatrol } from "./corridor-patrol";
 import { astar } from "./path";
 import { COL, FLOOR_COUNT, TILE, Tile } from "./palette";
 import { SurvivorRig } from "./rig";
@@ -78,6 +79,10 @@ interface Zombie {
   patrol: { x: number; y: number }[];
   patrolIndex: number;
   patrolPause: number;
+  patrolStuck: number;
+  patrolLastDist: number;
+  patrolScanT: number;
+  groupId?: number;
   grabWindup: number;
   grabCd: number;
   downT: number;
@@ -728,9 +733,19 @@ export class Game {
     return s;
   }
 
-  private makeZombie(s: { x: number; y: number; kind: ZombieKind; room: number; missionTag?: Zombie["missionTag"] }): Zombie {
+  private makeZombie(s: {
+    x: number;
+    y: number;
+    kind: ZombieKind;
+    room: number;
+    missionTag?: Zombie["missionTag"];
+    patrol?: { x: number; y: number }[];
+    groupId?: number;
+  }): Zombie {
     const st = ZT[s.kind];
     const mult = s.kind === "boss" ? 1 : 1 + this.floorIndex * 0.05;
+    const presetPatrol = s.patrol?.length ? s.patrol.map((pt) => ({ x: pt.x, y: pt.y })) : [];
+    const startIdx = presetPatrol.length >= 2 ? 1 : 0;
     return {
       x: s.x,
       y: s.y,
@@ -764,14 +779,13 @@ export class Game {
       stimulus: null,
       stimulusUntil: 0,
       searchT: 0,
-      patrol: this.floor?.data.roomZones[s.room] === "KORYTARZ" && this.floor.data.rooms[s.room]
-        ? [0.15, 0.5, 0.85].map((part) => ({
-            x: this.floor!.data.rooms[s.room].x + Math.max(1, Math.floor(this.floor!.data.rooms[s.room].w * part)),
-            y: this.floor!.data.rooms[s.room].y + 1,
-          }))
-        : [],
-      patrolIndex: Math.floor(Math.random() * 3),
-      patrolPause: Math.random() * 2,
+      patrol: presetPatrol,
+      patrolIndex: startIdx,
+      patrolPause: presetPatrol.length ? (s.groupId ? 0.35 + Math.random() * 0.7 : Math.random() * 1.1) : 0,
+      patrolStuck: 0,
+      patrolLastDist: Infinity,
+      patrolScanT: Math.random() * 3,
+      ...(s.groupId !== undefined ? { groupId: s.groupId } : {}),
       grabWindup: 0,
       grabCd: 2 + Math.random() * 5,
       downT: 0,
@@ -828,11 +842,22 @@ export class Game {
       if (p.kind === "radio" || p.kind === "tv") this.tactical.ensureDevice(p.id, p.kind, (p.x + 0.5) * TILE, (p.y + 0.5) * TILE);
       if (p.kind === "explosive") this.tactical.ensureBarrel(p.id);
     }
+    const floorPopCap = () => {
+      const d = this.data();
+      if (d.corridorReport) return d.corridorReport.populationCap;
+      const baseInitial = d.zombies.length;
+      return Math.min(
+        TACTICAL.waves.populationMax,
+        Math.max(
+          TACTICAL.waves.basePopulation + Math.floor(d.rooms.length / 5) * TACTICAL.waves.populationPerFiveRooms,
+          baseInitial + TACTICAL.waves.waveHeadroom,
+        ),
+      );
+    };
     this.tactical.update(dt, (device) => {
       if (Math.hypot(device.x - this.px, device.y - this.py) < 12 * TILE) this.sfx.device(device.kind, true);
     }, (source) => this.spawnTacticalWave(source), () => {
-      const cap = Math.min(TACTICAL.waves.populationMax,
-        TACTICAL.waves.basePopulation + Math.floor(this.data().rooms.length / 5) * TACTICAL.waves.populationPerFiveRooms);
+      const cap = floorPopCap();
       const alive = this.floor!.zombies.filter((z) => z.state !== "dead").length;
       return alive >= cap || this.tactical!.state.waveBudget < TACTICAL.waves.budgetPerZombie || this.floorIndex >= 10;
     });
@@ -851,7 +876,10 @@ export class Game {
   private spawnTacticalWave(source: Stimulus): number {
     if (!this.floor || !this.tactical) return 0;
     const alive = this.floor.zombies.filter((z) => z.state !== "dead").length;
-    const cap = Math.min(TACTICAL.waves.populationMax, TACTICAL.waves.basePopulation + Math.floor(this.data().rooms.length / 5));
+    const cap = this.data().corridorReport?.populationCap ?? Math.min(
+      TACTICAL.waves.populationMax,
+      Math.max(TACTICAL.waves.basePopulation + Math.floor(this.data().rooms.length / 5), this.data().zombies.length + TACTICAL.waves.waveHeadroom),
+    );
     const room = Math.max(0, Math.min(TACTICAL.waves.maxPerWave, cap - alive, Math.floor(this.tactical.state.waveBudget / TACTICAL.waves.budgetPerZombie)));
     if (room <= 0) return 0;
     const d = this.data();
@@ -2951,34 +2979,135 @@ export class Game {
         if (distP < 6.5 * TILE && !this.vis[this.idx(Math.floor(z.x / TILE), Math.floor(z.y / TILE))])
           this.sfx.groan(this.time, z.kind);
       } else {
-        const patrolRoom = this.data().rooms[z.home];
-        if (!z.patrol.length && patrolRoom && this.data().roomZones[z.home] === "KORYTARZ") {
-          z.patrol = [0.15, 0.5, 0.85].map((part) => ({
-            x: patrolRoom.x + Math.max(1, Math.floor(patrolRoom.w * part)),
-            y: patrolRoom.y + 1,
-          }));
-          z.patrolIndex = Math.floor(Math.random() * z.patrol.length);
+        const dFloor = this.data();
+        const patrolRoom = dFloor.rooms[z.home];
+        if (!z.patrol.length && patrolRoom && dFloor.roomZones[z.home] === "KORYTARZ") {
+          z.patrol = buildFallbackCorridorPatrol(dFloor, z.x, z.y);
+          z.patrolIndex = z.patrol.length > 1 ? 1 : 0;
+          z.patrolPause = 0.4 + Math.random() * 1.0;
         }
-        if (z.patrol.length) {
+        if (z.patrol.length >= 2) {
           const target = z.patrol[z.patrolIndex % z.patrol.length];
-          z.patrolPause -= dt;
-          if (z.patrolPause > 0) continue;
-          const tx = (target.x + 0.5) * TILE, ty = (target.y + 0.5) * TILE;
-          if (Math.hypot(z.x - tx, z.y - ty) < 7) {
-            z.patrolIndex = (z.patrolIndex + 1) % z.patrol.length;
-            z.patrolPause = 1.2 + Math.random() * 2.4;
-            z.path = [];
-          } else {
-            z.pathT -= dt;
-            if (z.pathT <= 0 || !z.path.length) {
-              z.pathT = 0.7;
-              z.path = astar(this.data().w, this.data().h, Math.floor(z.x / TILE), Math.floor(z.y / TILE), target.x, target.y, (x, y) => this.walkable(x, y, false)) ?? [];
+          if (z.patrolPause > 0) {
+            z.patrolPause -= dt;
+            z.patrolScanT -= dt;
+            // Pause briefly at intersections and visibly look around the corridor.
+            if (z.patrolScanT <= 0) {
+              z.patrolScanT = 0.55 + Math.random() * 0.5;
+              const order: Dir[] = ["up", "right", "down", "left"];
+              z.dir = order[(order.indexOf(z.dir) + (Math.random() < 0.5 ? 1 : 3)) % 4];
             }
-            if (z.path.length) {
-              const n = z.path[0];
-              this.stepZombie(z, (n.x + 0.5) * TILE, (n.y + 0.5) * TILE, dt, 0.52);
-              if (Math.hypot(z.x - (n.x + 0.5) * TILE, z.y - (n.y + 0.5) * TILE) < 5) z.path.shift();
-            } else this.stepZombie(z, tx, ty, dt, 0.52);
+            continue;
+          }
+          // Patrol only along open passable corridor tiles (fallback to open floor if a corpse/feature moved)
+          const tx = (target.x + 0.5) * TILE;
+          const ty = (target.y + 0.5) * TILE;
+          const remain = Math.hypot(z.x - tx, z.y - ty);
+          // Slight natural loose spread for group members (arrives comfortably near waypoint without piling tightly!)
+          const arriveDist = z.groupId !== undefined ? 18 : 8;
+          if (remain < arriveDist) {
+            // In patrol groups, briefly hold & observe until trailing allies catch up near this intersection
+            if (z.groupId !== undefined) {
+              const pack = list.filter((a) => a.state === "idle" && a.groupId === z.groupId && a.patrolIndex === z.patrolIndex);
+              const waitingOn = pack.some((a) => a !== z && Math.hypot(a.x - tx, a.y - ty) > 36 && a.patrolStuck < 2.2);
+              if (waitingOn) {
+                z.patrolPause = 0.25;
+                z.path = [];
+                continue;
+              }
+              // Synchronized departure with natural slight stagger keeps groups haunting corridors side-by-side!
+              const nextIdx = (z.patrolIndex + 1) % z.patrol.length;
+              pack.forEach((m, k) => {
+                m.patrolIndex = nextIdx;
+                m.patrolPause = 1.0 + k * 0.3 + Math.random() * 0.2;
+                m.patrolStuck = 0;
+                m.patrolLastDist = Infinity;
+                m.path = [];
+              });
+              continue;
+            }
+            z.patrolIndex = (z.patrolIndex + 1) % z.patrol.length;
+            z.patrolPause = 0.9 + Math.random() * 1.6;
+            z.patrolStuck = 0;
+            z.patrolLastDist = Infinity;
+            z.path = [];
+            continue;
+          }
+          // Watchdog: detect obstacle change/blockage and repath or advance cleanly to next reachable waypoint.
+          if (remain < z.patrolLastDist - 1.2) {
+            z.patrolLastDist = remain;
+            z.patrolStuck = 0;
+          } else {
+            z.patrolStuck += dt;
+          }
+          const patrolPass = (x: number, y: number) => {
+            if (!this.walkable(x, y, true)) return false;
+            const rid = dFloor.roomOf[this.idx(x, y)];
+            const zn = rid >= 0 ? dFloor.roomZones[rid] : "";
+            // Stay in main corridor circulation while calmly patrolling; only step out when alerted!
+            return zn === "KORYTARZ" || (x === Math.floor(z.x / TILE) && y === Math.floor(z.y / TILE));
+          };
+          z.pathT -= dt;
+          const nextBlocked = z.path.length > 0 && !this.walkable(z.path[0].x, z.path[0].y, true);
+          if (z.pathT <= 0 || !z.path.length || nextBlocked || z.patrolStuck > 1.4) {
+            z.pathT = 0.85;
+            const zx = Math.floor(z.x / TILE);
+            const zy = Math.floor(z.y / TILE);
+            let nextPath = astar(dFloor.w, dFloor.h, zx, zy, target.x, target.y, patrolPass);
+            if (!nextPath) {
+              // If zombie walked into an apartment chasing noise and now calmed down, walk back through open tiles/doors to corridor patrol!
+              nextPath = astar(dFloor.w, dFloor.h, zx, zy, target.x, target.y, (x, y) => this.walkable(x, y, false));
+            }
+            z.path = nextPath ?? [];
+            if ((!z.path.length || z.patrolStuck > 3.2) && z.patrol.length >= 2) {
+              const nextIdx = (z.patrolIndex + 1) % z.patrol.length;
+              if (z.groupId !== undefined) {
+                for (const m of list) {
+                  if (m.state === "idle" && m.groupId === z.groupId) {
+                    m.patrolIndex = nextIdx;
+                    m.patrolPause = 0.4 + Math.random() * 0.4;
+                    m.patrolStuck = 0;
+                    m.patrolLastDist = Infinity;
+                    m.path = [];
+                  }
+                }
+              } else {
+                z.patrolIndex = nextIdx;
+                z.patrolPause = 0.5 + Math.random() * 0.8;
+                z.patrolStuck = 0;
+                z.patrolLastDist = Infinity;
+                z.path = [];
+              }
+              continue;
+            }
+          }
+          if (z.path.length) {
+            const n = z.path[0];
+            // Keep unified measured patrol speed inside a group (runner matches shambler calm gait) with natural spacing!
+            const baseMul = z.groupId !== undefined ? Math.min(0.68, 13.5 / Math.max(12, z.speed)) : 0.54;
+            let speedMul = baseMul;
+            if (z.groupId !== undefined) {
+              for (const ally of list) {
+                if (ally === z || ally.state !== "idle" || ally.groupId !== z.groupId) continue;
+                const d = Math.hypot(ally.x - z.x, ally.y - z.y);
+                const toWay = (ally.x - z.x) * ((n.x + 0.5) * TILE - z.x) + (ally.y - z.y) * ((n.y + 0.5) * TILE - z.y);
+                if (d < 18 && toWay > 0) speedMul *= 0.72; // gentle gap spacing so pack walks slightly staggered
+              }
+            }
+            const nx = (n.x + 0.5) * TILE;
+            const ny = (n.y + 0.5) * TILE;
+            // Break out any unlocked door smoothly if returning from apartment after a search
+            const blocker = this.tileAt(n.x, n.y) === 2 ? this.doorAt(n.x, n.y) : undefined;
+            if (blocker && !blocker.open && !blocker.broken && !blocker.locked && !blocker.sealed && !blocker.route) {
+              if (z.bashT <= 0) {
+                z.bashT = 0.9;
+                blocker.open = true;
+                dFloor.tiles[this.idx(blocker.x, blocker.y)] = Tile.DoorOpen;
+              }
+            } else {
+              this.stepZombie(z, nx, ny, dt, speedMul);
+              if (Math.hypot(z.x - nx, z.y - ny) < 6) z.path.shift();
+            }
           }
           continue;
         }

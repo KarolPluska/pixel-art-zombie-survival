@@ -13,7 +13,6 @@
     "@fontsource/pixelify-sans": "^5.3.0",
     "@fontsource/rajdhani": "^5.3.0",
     "clsx": "2.1.1",
-    "playwright": "^1.65.1",
     "react": "19.2.6",
     "react-dom": "19.2.6",
     "tailwind-merge": "3.4.0"

@@ -484,9 +484,9 @@ export function installVerticalQuests(f: FloorData, runSeed?: number) {
       }
     }
     const workshop =
-      normalRooms.find((r) => f.roomZones[r.id] === "WARSZTAT") ??
-      normalRooms.find((r) => f.roomZones[r.id] === "SCHOWEK") ??
-      normalRooms[0];
+      normalRooms.find((r) => f.roomZones[r.id] === "WARSZTAT" && openRoomCells(f, r, avoid).length > 0) ??
+      normalRooms.find((r) => f.roomZones[r.id] === "SCHOWEK" && openRoomCells(f, r, avoid).length > 0) ??
+      normalRooms.find((r) => openRoomCells(f, r, avoid).length > 0);
     const fuseRoom = workshop;
     const fuseCell = fuseRoom ? openRoomCells(f, fuseRoom, avoid)[0] : undefined;
     f.vertical.quest = {
@@ -532,8 +532,8 @@ export function installVerticalQuests(f: FloorData, runSeed?: number) {
         const cx = r.x + r.w / 2;
         const cy = r.y + r.h / 2;
         const d = Math.hypot(cx - f.stairsUp!.x, cy - f.stairsUp!.y);
-        return d >= 10 && d <= 28;
-      }) ?? normalRooms[0];
+        return d >= 10 && d <= 28 && openRoomCells(f, r, avoid).length > 0;
+      }) ?? normalRooms.find((r) => openRoomCells(f, r, avoid).length > 0);
     const beacon = sideRoom ? openRoomCells(f, sideRoom, avoid)[0] : undefined;
     const horde: Cell[] = [];
     if (stairRoom) {
@@ -562,8 +562,9 @@ export function installVerticalQuests(f: FloorData, runSeed?: number) {
 
   if (kind === "service-shaft" && f.vertical.service) {
     const office =
-      normalRooms.find((r) => ["LOKAL UŻYTKOWY", "WARSZTAT", "SCHOWEK", "KOTŁOWNIA"].includes(f.roomZones[r.id])) ??
-      normalRooms[0];
+      normalRooms.find(
+        (r) => ["LOKAL UŻYTKOWY", "WARSZTAT", "SCHOWEK", "KOTŁOWNIA"].includes(f.roomZones[r.id]) && openRoomCells(f, r, avoid).length > 0,
+      ) ?? normalRooms.find((r) => openRoomCells(f, r, avoid).length > 0);
     const clueCell = office ? openRoomCells(f, office, avoid)[0] : undefined;
     const code = `${1 + rng.int(8)}-${1 + rng.int(8)}-${1 + rng.int(8)}`;
     f.vertical.quest = {
@@ -580,11 +581,10 @@ export function installVerticalQuests(f: FloorData, runSeed?: number) {
     // Evacuation plan near the main corridor or western side + bypass obstacle in an east apartment
     const eastRoom =
       normalRooms
-        .slice()
-        .sort((a, b) => Math.abs(b.x - f.vertical!.stairsB!.outside.x) - Math.abs(a.x - f.vertical!.stairsB!.outside.x))
-        .pop() ?? normalRooms[0];
-    const corridor = f.rooms.find((r) => f.roomZones[r.id] === "KORYTARZ");
-    const clueCell = corridor ? openRoomCells(f, corridor, avoid).find((p) => p.x >= 10 && p.x <= 24) : undefined;
+        .filter((r) => openRoomCells(f, r, avoid).length > 0)
+        .sort((a, b) => Math.abs(a.x + a.w / 2 - f.vertical!.stairsB!.outside.x) - Math.abs(b.x + b.w / 2 - f.vertical!.stairsB!.outside.x))[0];
+    const corridor = f.rooms.find((r) => f.roomZones[r.id] === "KORYTARZ" && openRoomCells(f, r, avoid).some((p) => p.x >= 10 && p.x <= 28));
+    const clueCell = corridor ? openRoomCells(f, corridor, avoid).find((p) => p.x >= 10 && p.x <= 28) : undefined;
     const bypassCell = eastRoom ? openRoomCells(f, eastRoom, avoid)[0] : undefined;
     f.vertical.quest = {
       kind: "apartment-bypass",

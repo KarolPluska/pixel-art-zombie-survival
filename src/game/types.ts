@@ -57,6 +57,27 @@ export interface LightFixture {
   radius: number;
 }
 
+export type ApartmentFamily =
+  | "kawalerka"
+  | "dwupokojowe"
+  | "rodzinne"
+  | "narozne"
+  | "wydluzone"
+  | "przebudowane"
+  | "zaplecze"
+  | "uslugowy";
+
+export type RoomFunctionRole =
+  | "public"
+  | "entry"
+  | "living"
+  | "private"
+  | "kitchen"
+  | "wet"
+  | "storage"
+  | "tech"
+  | "stair";
+
 export interface Room {
   id: number;
   x: number;
@@ -66,6 +87,97 @@ export interface Room {
   role: "start" | "stairs" | "normal";
   lit: boolean;
   flicker: boolean;
+  apartmentId?: number;
+  functionRole?: RoomFunctionRole;
+}
+
+export interface ApartmentInfo {
+  id: number;
+  family: ApartmentFamily;
+  label: string;
+  roomIds: number[];
+  entryDoor: { x: number; y: number };
+  secondaryExit?: { x: number; y: number; reason: string; detour: number };
+  isBypass: boolean;
+  plumbingEdge?: "n" | "s" | "e" | "w";
+  bounds: { x: number; y: number; w: number; h: number };
+}
+
+export interface CorridorZoneInfo {
+  id: number;
+  kind: "segment" | "junction" | "lobby" | "landing";
+  cells: { x: number; y: number }[];
+  center: { x: number; y: number };
+  neighbors: number[];
+  onMainRoute: boolean;
+  eligible: boolean;
+  importance: number;
+  plannedZombies: number;
+  placedZombies: number;
+  mode: "empty" | "solo" | "group";
+  groupSize: number;
+  patrolRoute: { x: number; y: number }[];
+  rejectReason?: string;
+}
+
+export interface CorridorPopulationReport {
+  floor: number;
+  totalZones: number;
+  eligibleZones: number;
+  occupiedZones: number;
+  occupancyRate: number;
+  targetRate: number;
+  plannedCorridor: number;
+  placedCorridor: number;
+  roomZombies: number;
+  totalInitial: number;
+  soloPatrols: number;
+  groupPatrols: number;
+  groupMembers: number;
+  longestEmptyRun: number;
+  mainRouteCovered: number;
+  mainRouteEligible: number;
+  populationCap: number;
+  waveHeadroom: number;
+  rejections: string[];
+  zones: CorridorZoneInfo[];
+}
+
+export interface PropAccessPoint {
+  propId: number;
+  kind: PropKind;
+  x: number;
+  y: number;
+  ax: number;
+  ay: number;
+  role: "hide" | "device" | "loot" | "furniture";
+}
+
+export interface LayoutQualityReport {
+  repairsApplied: number;
+  apartments: number;
+  apartmentFamilies: Record<string, number>;
+  publicEntryDoors: number;
+  internalDoors: number;
+  bypassDoors: number;
+  barricadedDoors: number;
+  duplicateRoomPairDoors: number;
+  closeSameRoomDoors: number;
+  closeJustifiedPairs: number;
+  blockedThresholds: number;
+  roomsFurnished: number;
+  wardrobesAccessible: number;
+  wardrobesTotal: number;
+  devicesTotal: number;
+  devicesWallMounted: number;
+  devicesAccessible: number;
+  lootAccessible: number;
+  lootTotal: number;
+  bypassApartments: number;
+  validBypassRoutes: number;
+  breachesCount: number;
+  damageCells: number;
+  issues: string[];
 }
 
 export interface Prop {
@@ -82,6 +194,8 @@ export interface Prop {
   opened: boolean;
 }
 
+export type DoorKind = "entry" | "internal" | "bypass" | "service" | "stair" | "shaft" | "annex";
+
 export interface DoorInfo {
   x: number;
   y: number;
@@ -92,6 +206,9 @@ export interface DoorInfo {
   open: boolean;
   broken: boolean;
   route?: "elevator" | "service" | "stairsB";
+  kind?: DoorKind;
+  rooms?: [number, number];
+  reason?: string;
 }
 
 export interface SurvivorSpawn {
@@ -118,6 +235,10 @@ export interface ZombieSpawn {
   y: number;
   kind: ZombieKind;
   room: number;
+  role?: "corridor-solo" | "corridor-group" | "room" | "crawler" | "lure" | "guard" | "boss";
+  patrolZone?: number;
+  patrol?: { x: number; y: number }[];
+  groupId?: number;
 }
 
 export interface WindowInfo {
@@ -202,6 +323,10 @@ export interface FloorData {
   flare: { x: number; y: number } | null;
   environment?: EnvironmentPlan;
   vertical?: VerticalFloor;
+  apartments?: ApartmentInfo[];
+  corridorReport?: CorridorPopulationReport;
+  qualityReport?: LayoutQualityReport;
+  propAccess?: PropAccessPoint[];
 }
 
 export interface RunStats {
