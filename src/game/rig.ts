@@ -15,6 +15,7 @@ export interface RigState {
   melee: number;
   flash: number;
   hurt: number;
+  pushing: boolean;
 }
 
 const S = 56;
@@ -143,6 +144,17 @@ export class SurvivorRig {
     const off = side ? sh : right ? -6 : 4;
     const shotgun = s.weapon === "shotgun";
 
+    if (s.pushing) {
+      const ax = ca, ay = Math.sin(s.aim), pulse = Math.floor(s.t * 9) % 3;
+      const hx = ax * (7 + (pulse === 1 ? 2 : 0));
+      const py = cy + ay * 6 - 2;
+      this.L(off, cy - 1, hx + ay * 2, py - ax * 2, COL.jacketDark, 2);
+      this.hand(hx + ay * 2, py - ax * 2);
+      this.L(sh, cy, hx - ay * 2, py + ax * 2, SLEEVE, 2);
+      this.hand(hx - ay * 2, py + ax * 2);
+      return;
+    }
+
     if (s.melee >= 0) {
       const m = s.melee;
       // Broń palna opuszczona w drugiej ręce
@@ -169,8 +181,20 @@ export class SurvivorRig {
         this.L(hx, hy, ax * 16, cy + ay * 16, COL.rustDark, 2);
         this.L(hx + ax * 2, hy + ay * 2, ax * 15, cy + ay * 15, "#d0562e");
         if (s.weapon === "hatchet") {
-          this.L(ax * 13, cy + ay * 13, ax * 16 - ay * 4, cy + ay * 16 + ax * 4, "#bac4be", 3);
-        } else this.L(ax * 16, cy + ay * 16, ax * 16 + Math.cos(a + 1.2) * 3, cy + ay * 16 + Math.sin(a + 1.2) * 3, "#cfd6dc");
+          const bx = Math.round(ax * 14 - ay * 2);
+          const by = Math.round(cy + ay * 14 + ax * 2);
+          this.L(bx, by, bx - ay * 5, by + ax * 5, "#3e4a4c", 5);
+          this.L(bx - ay, by + ax, bx - ay * 5, by + ax * 5, "#8d9a98", 3);
+          this.L(bx - ay * 2, by + ax * 2, bx - ay * 5, by + ax * 5, "#d2dbd2", 1);
+        } else if (s.weapon === "machete") {
+          this.L(hx + ax * 3, hy + ay * 3, ax * 20, cy + ay * 20, "#333c40", 3);
+          this.L(hx + ax * 5, hy + ay * 5, ax * 21, cy + ay * 21, "#c4d0ca", 1);
+          this.L(ax * 18 - ay, cy + ay * 18 + ax, ax * 22 - ay * 2, cy + ay * 22 + ax * 2, "#eef0dc", 1);
+          this.L(hx + ax + ay * 2, hy + ay - ax * 2, hx + ax - ay * 2, hy + ay + ax * 2, "#8d6b3e", 2);
+        } else {
+          this.L(ax * 16, cy + ay * 16, ax * 16 + Math.cos(a + 1.2) * 3, cy + ay * 16 + Math.sin(a + 1.2) * 3, "#cfd6dc");
+          this.L(ax * 16, cy + ay * 16, ax * 15, cy + ay * 15, "#e4e9dd", 1);
+        }
         this.hand(hx, hy);
         if (e < 1) this.trail = { a, cy };
       }
@@ -180,6 +204,11 @@ export class SurvivorRig {
     if (!WEAPONS[s.weapon].ammo) {
       this.L(sh, cy - 2, sh + sw * 2, cy + 3, SLEEVE, 2);
       this.L(off, cy - 2, off - sw * 2, cy + 3, COL.jacketDark, 2);
+      // Broń biała spoczywa na plecach: trzonek i stalowy koniec są widoczne.
+      this.L(sh - 2, cy + 2, sh + 1, cy - 6, COL.rustDark, 2);
+      this.L(sh, cy - 6, sh + 1, cy - 8, s.weapon === "hatchet" ? "#9aa8a4" : "#cfd6dc", 2);
+      if (s.weapon === "hatchet") this.L(sh - 3, cy - 8, sh + 2, cy - 8, "#bac4be", 3);
+      else this.L(sh + 1, cy - 8, sh + 3, cy - 8, "#cfd6dc", 2);
       this.hand(sh + sw * 2, cy + 4);
       this.hand(off - sw * 2, cy + 4);
       return;
@@ -213,24 +242,39 @@ export class SurvivorRig {
       for (const sign of [-1, 1]) {
         this.L(hx + ax * 10, hy + ay * 10, hx + ax * 6 + nx * 8 * sign, hy + ay * 6 + ny * 8 * sign, "#7f8981", 2);
         this.L(hx + ax * 6 + nx * 8 * sign, hy + ay * 6 + ny * 8 * sign, hx, hy, "#b9b7a2");
+        this.L(hx + ax * 6 + nx * 8 * sign, hy + ay * 6 + ny * 8 * sign, hx + ax * 4 + nx * 7 * sign, hy + ay * 4 + ny * 7 * sign, "#dfe1c9", 1);
       }
+      this.L(hx - ax * 2, hy - ay * 2, hx + ax * 14, hy + ay * 14, "#c9ccae", 1);
+      this.L(hx + ax * 13, hy + ay * 13, hx + ax * 16, hy + ay * 16, "#e8e2c4", 2);
+      this.tip = { x: hx + ax * 16, y: hy + ay * 16 };
     } else if (shotgun) {
       this.L(hx - ax * 4, hy - ay * 4, hx + ax * 3, hy + ay * 3, COL.wood, 2);
       this.L(hx + ax * 3, hy + ay * 3, hx + ax * 13, hy + ay * 13, "#383e46");
       this.L(hx + ax * 3 + nx, hy + ay * 3 + ny, hx + ax * 13 + nx, hy + ay * 13 + ny, "#727b86");
+      this.L(hx + ax * 3 - nx, hy + ay * 3 - ny, hx + ax * 13 - nx, hy + ay * 13 - ny, "#4a555f", 1);
       this.L(hx + ax * 6, hy + ay * 6, hx + ax * 9, hy + ay * 9, COL.woodLight, 2);
+      this.L(hx + ax * 7 - nx * 2, hy + ay * 7 - ny * 2, hx + ax * 9 - nx * 2, hy + ay * 9 - ny * 2, "#d8b25f", 2);
       this.hand(hx + ax * 6, hy + ay * 6);
       this.tip = { x: hx + ax * 15, y: hy + ay * 15 };
     } else {
-      this.L(hx, hy, hx + ax * 7, hy + ay * 7, COL.gun);
-      this.L(hx + nx, hy + ny, hx + ax * 7 + nx, hy + ay * 7 + ny, "#6a727c");
+      const revolver = s.weapon === "revolver";
+      const barrel = revolver ? 10 : 7;
+      this.L(hx, hy, hx + ax * barrel, hy + ay * barrel, COL.gun);
+      this.L(hx + nx, hy + ny, hx + ax * barrel + nx, hy + ay * barrel + ny, "#6a727c");
       this.L(hx + ax, hy + ay, hx + ax - nx * 2, hy + ay - ny * 2, "#3a342e");
-      if (s.weapon === "revolver") {
+      if (revolver) {
         this.L(hx + ax * 2, hy + ay * 2, hx + ax * 4, hy + ay * 4, "#9f9b96", 3);
         this.L(hx + ax * 5, hy + ay * 5, hx + ax * 10, hy + ay * 10, "#a5aaa6");
+        this.L(hx + ax * 2 + nx * 2, hy + ay * 2 + ny * 2, hx + ax * 4 + nx * 2, hy + ay * 4 + ny * 2, "#3c4448", 1);
+        this.L(hx + ax * 9 + nx, hy + ay * 9 + ny, hx + ax * 10 + nx, hy + ay * 10 + ny, "#d8caa0", 1);
+      } else {
+        for (let i = 1; i <= 3; i++) {
+          this.L(hx + ax * i + nx, hy + ay * i + ny, hx + ax * i + nx * 2, hy + ay * i + ny * 2, "#20272b", 1);
+        }
+        this.L(hx + ax * 6, hy + ay * 6, hx + ax * 6 + nx * 2, hy + ay * 6 + ny * 2, "#c3c9bc", 1);
       }
       if (s.reload > 0) this.hand(hx + ax * 2 - nx * 2, hy + ay * 2 - ny * 2);
-      this.tip = { x: hx + ax * 9, y: hy + ay * 9 };
+      this.tip = { x: hx + ax * (revolver ? 12 : 9), y: hy + ay * (revolver ? 12 : 9) };
     }
     this.hand(hx, hy);
   }
@@ -241,11 +285,11 @@ export class SurvivorRig {
     this.reset();
     const side = s.dir === "left" || s.dir === "right";
     this.f = s.dir === "left" ? -1 : 1;
-    const sw = s.moving ? Math.sin(s.phase) : 0;
+    const sw = s.pushing ? (Math.floor(s.t * 9) % 2 ? -0.65 : 0.65) : s.moving ? Math.sin(s.phase) : 0;
     const co = s.moving ? Math.cos(s.phase) : 0;
     const lift = s.sprint ? 3 : 2;
-    const by = (s.moving ? Math.round(Math.abs(co)) : 0) + (s.hurt > 0.6 ? 1 : 0);
-    const hy = by - (!s.moving && Math.sin(s.t * 2.4) > 0.2 ? 1 : 0);
+    const by = (s.pushing ? 1 + (Math.floor(s.t * 9) % 2) : s.moving ? Math.round(Math.abs(co)) : 0) + (s.hurt > 0.6 ? 1 : 0);
+    const hy = by - (!s.moving && !s.pushing && Math.sin(s.t * 2.4) > 0.2 ? 1 : 0);
     const ca = Math.cos(s.aim);
     const sa = Math.sin(s.aim);
     const behind = sa < -0.35;

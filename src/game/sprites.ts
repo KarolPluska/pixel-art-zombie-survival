@@ -1576,6 +1576,7 @@ export class Art {
       runner: { down: blank(), up: blank(), left: blank(), right: blank() },
       brute: { down: blank(), up: blank(), left: blank(), right: blank() },
       boss: { down: blank(), up: blank(), left: blank(), right: blank() },
+      crawler: { down: blank(), up: blank(), left: blank(), right: blank() },
     };
     for (const kind of ["shambler", "runner", "brute"] as ZombieKind[]) {
       const w = kind === "brute" ? 20 : 18;
@@ -1593,6 +1594,7 @@ export class Art {
       runner: makeCanvas(18, 16, (s) => paintCorpse(s, "runner"), true),
       brute: makeCanvas(18, 16, (s) => paintCorpse(s, "brute"), true),
       boss: makeCanvas(18, 16, (s) => paintCorpse(s, "brute"), true),
+      crawler: makeCanvas(18, 16, (s) => paintCorpse(s, "shambler"), true),
     };
 
     this.crateOpen = makeCanvas(16, 16, (s) => paintCrate(s, true), true);
@@ -1628,6 +1630,8 @@ export class Art {
       desk: makeCanvas(32, 16, paintDesk, true),
       barrel: makeCanvas(16, 16, paintBarrel, true),
       tv: makeCanvas(16, 16, paintTv, true),
+      radio: makeCanvas(16, 16, paintTv, true),
+      explosive: makeCanvas(16, 16, paintBarrel, true),
       radiator: makeCanvas(16, 16, paintRadiator, true),
       sink: makeCanvas(16, 16, paintSink, true),
       trash: makeCanvas(16, 16, paintTrash, true),

@@ -1,4 +1,4 @@
-export const WEAPON_IDS = ["crowbar", "pistol", "hatchet", "revolver", "shotgun", "crossbow"] as const;
+export const WEAPON_IDS = ["crowbar", "pistol", "hatchet", "revolver", "shotgun", "crossbow", "machete"] as const;
 export type WeaponId = typeof WEAPON_IDS[number];
 export type AmmoKind = "rounds" | "shells" | "bolts";
 export type Slots = [WeaponId | null, WeaponId | null, WeaponId | null];
@@ -25,6 +25,7 @@ export const WEAPONS: Record<WeaponId, WeaponSpec> = {
   revolver: { name: "Rewolwer", category: "Broń krótka", description: "Sześć mocnych strzałów. Korzysta z tego samego zapasu nabojów co pistolet.", location: "Parter / biurko dozorcy", ammo: "rounds", capacity: 6, damage: 49, cooldown: 0.49, reach: 170, reload: 1.3, pellets: 1, noise: 16 },
   shotgun: { name: "Strzelba", category: "Broń długa", description: "Dwa ładunki śrutu na bliskie spotkania. Huk niesie się po całym piętrze.", location: "Piętro III / szafa myśliwego", ammo: "shells", capacity: 2, damage: 14, cooldown: 0.64, reach: 76, reload: 1.15, pellets: 6, noise: 19 },
   crossbow: { name: "Kusza", category: "Broń miotająca", description: "Jeden cichy bełt zamiast głośnego strzału. Po każdym trafieniu potrzebuje chwili na przeładowanie.", location: "Piętro V / szafa sportowca", ammo: "bolts", capacity: 1, damage: 72, cooldown: 0.72, reach: 165, reload: 1.4, pellets: 1, noise: 2.5 },
+  machete: { name: "Maczeta", category: "Broń biała", description: "Szybka, szeroka maczeta. Krótsza przerwa między cięciami i duża szansa rozpołowienia stojącego zombie.", location: "Piętro I / szafa sportowca", ammo: null, capacity: 0, damage: 42, cooldown: 0.34, reach: 23, reload: 0, pellets: 1, noise: 3.8 },
 };
 
 export interface InventoryState {
@@ -46,7 +47,7 @@ export function starterInventory(preferred?: Slots): InventoryState {
     slots.splice(0, 3, ...preferred);
   }
   return { owned: ["crowbar", "pistol"], slots, active: slots.findIndex(Boolean),
-    magazines: { crowbar: 0, pistol: 8, hatchet: 0, revolver: 0, shotgun: 0, crossbow: 0 },
+    magazines: { crowbar: 0, pistol: 8, hatchet: 0, revolver: 0, shotgun: 0, crossbow: 0, machete: 0 },
     stock: { rounds: 18, shells: 0, bolts: 0 } };
 }
 
@@ -77,4 +78,4 @@ export function discover(inv: InventoryState, id: WeaponId) {
   return true;
 }
 
-export const DISCOVERIES: Partial<Record<number, WeaponId>> = { 0: "hatchet", 1: "revolver", 4: "shotgun", 6: "crossbow" };
+export const DISCOVERIES: Partial<Record<number, WeaponId>> = { 0: "hatchet", 1: "revolver", 2: "machete", 4: "shotgun", 6: "crossbow" };

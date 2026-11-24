@@ -1,0 +1,57 @@
+{
+  "seeds": 32,
+  "baseline": {
+    "uniqueStarts": 4,
+    "uniqueExits": 9,
+    "uniqueCorridorSignatures": 4,
+    "fallbacks": 0,
+    "avgPath": 74.2,
+    "avgJunctions": 28.7,
+    "avgTurns": 3.2,
+    "avgCorridorCells": 53.8
+  },
+  "current": {
+    "uniqueStarts": 32,
+    "uniqueExits": 6,
+    "uniqueCorridorSignatures": 32,
+    "fallbacks": 0,
+    "rejected": 23,
+    "rejectionReasons": {
+      "unreachable supply: 55": 1,
+      "unreachable supply: 68": 1,
+      "unreachable supply: 96": 1,
+      "unreachable supply: 57": 1,
+      "unreachable supply: 109": 1,
+      "unreachable supply: 62": 1,
+      "unreachable supply: 61": 1,
+      "unreachable supply: 2": 1,
+      "unreachable supply: 17": 1,
+      "unreachable supply: 77": 1,
+      "unreachable supply: 69": 2,
+      "unreachable supply: 73": 1,
+      "unreachable supply: 31": 1,
+      "unreachable supply: 65": 1,
+      "unreachable supply: 74": 1,
+      "unreachable supply: 88": 1,
+      "unreachable supply: 100": 1,
+      "unreachable supply: 26": 1,
+      "unreachable supply: 36": 1,
+      "unreachable supply: 49": 1,
+      "unreachable supply: 81": 1,
+      "unreachable supply: 133": 1
+    },
+    "avgPath": 67.3,
+    "avgJunctions": 53.9,
+    "avgTurns": 12.5,
+    "avgCorridorCells": 88.9,
+    "families": {
+      "MAŁE PODESTY": 3,
+      "PIERŚCIEŃ": 4,
+      "DWA SKRZYDŁA": 3,
+      "ŁAMANE KORYTARZE": 10,
+      "MIESZKANIA PRZECHODNIE": 3,
+      "BRYŁA L/U": 3,
+      "WSPÓLNY HOL": 6
+    }
+  }
+}

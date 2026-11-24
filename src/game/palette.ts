@@ -14,6 +14,7 @@ export const Tile = {
   Rubble: 7,
   Puddle: 8,
   Sky: 9,
+  Hole: 10,
 } as const;
 
 export type TileId = (typeof Tile)[keyof typeof Tile];

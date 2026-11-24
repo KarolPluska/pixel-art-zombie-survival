@@ -68,7 +68,7 @@ export function Inventory({ pack, initial, onAssign, onClose, playing }: {
         </div>
       </div>
       <div className="weapon-detail">
-        <div className="item-blueprint"><span className="micro">{spec.category.toUpperCase()}</span><WeaponArt id={selected}/><span className="blueprint-number">0{WEAPON_IDS.indexOf(selected) + 1} / 06</span></div>
+        <div className="item-blueprint"><span className="micro">{spec.category.toUpperCase()}</span><WeaponArt id={selected}/><span className="blueprint-number">0{WEAPON_IDS.indexOf(selected) + 1} / 07</span></div>
         <div className="detail-copy"><h3>{spec.name}</h3><p>{spec.description}</p>
           <dl><div><dt>Obrażenia</dt><dd>{spec.damage}{spec.pellets > 1 && ` × ${spec.pellets}`}</dd></div>
           <div><dt>{spec.ammo ? "Magazynek" : "Amunicja"}</dt><dd>{spec.ammo ? (owned ? `${pack.magazines[selected]} / ${spec.capacity}` : `${spec.capacity} szt.`) : "Nie wymaga"}</dd></div>

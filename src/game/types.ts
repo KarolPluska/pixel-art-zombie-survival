@@ -1,8 +1,10 @@
 import type { Theme } from "./palette";
 import type { InventoryState, WeaponId } from "./inventory";
+import type { EnvironmentPlan } from "./environment-layout";
+import type { VerticalFloor } from "./vertical-layout";
 
-export type ZombieKind = "shambler" | "runner" | "brute" | "boss";
-export type Loot = WeaponId | "med" | "ammo" | "shells" | "bolts" | "battery" | "key" | "note" | null;
+export type ZombieKind = "shambler" | "runner" | "brute" | "boss" | "crawler";
+export type Loot = WeaponId | "med" | "ammo" | "shells" | "bolts" | "battery" | "key" | "note" | "fuse" | null;
 export type PropKind =
   | "bed"
   | "sofa"
@@ -40,7 +42,9 @@ export type PropKind =
   | "satellite"
   | "medbox"
   | "supplycase"
-  | "toy";
+  | "toy"
+  | "radio"
+  | "explosive";
 
 export type Glow = "none" | "fluor" | "orange";
 
@@ -82,10 +86,12 @@ export interface DoorInfo {
   x: number;
   y: number;
   locked: boolean;
+  sealed?: boolean;
   barricaded?: boolean;
   hp: number;
   open: boolean;
   broken: boolean;
+  route?: "elevator" | "service" | "stairsB";
 }
 
 export interface SurvivorSpawn {
@@ -194,6 +200,8 @@ export interface FloorData {
   locked: boolean;
   keyPropId: number | null;
   flare: { x: number; y: number } | null;
+  environment?: EnvironmentPlan;
+  vertical?: VerticalFloor;
 }
 
 export interface RunStats {
@@ -228,8 +236,11 @@ export interface HudState {
   kills: number;
   time: number;
   objective: string;
+  quest: { title: string; step: string } | null;
+  journal: string[];
   message: string;
   prompt: string;
+  environment: { label: string; hold: boolean; progress: number; active: boolean } | null;
   hurt: number;
   lowHp: boolean;
   reloading: number;
@@ -238,6 +249,10 @@ export interface HudState {
   bannerSub: string;
   seed: number;
   noise: number;
+  noiseLevel: number;
+  noiseLabel: string;
+  arousal: number;
+  grapple: { count: number; required: number } | null;
   zombiesLeft: number;
   bossHp: number;
   bossMax: number;

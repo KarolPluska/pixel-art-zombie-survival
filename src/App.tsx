@@ -3,7 +3,9 @@ import roofScene from "./assets/roof-flare.webp";
 import hall from "./assets/concept-hall.jpg";
 import roof from "./assets/concept-roof.jpg";
 import { Game } from "./game/engine";
+import { layoutProfile } from "./game/generate";
 import { Sfx } from "./game/audio";
+import { CHECKPOINT_KEY, parseCheckpoint, type RunCheckpoint } from "./game/checkpoint";
 import { FLOOR_META } from "./game/palette";
 import { assignSlot, starterInventory, type Slots, type WeaponId } from "./game/inventory";
 import type { HudState, RunStats } from "./game/types";
@@ -14,7 +16,7 @@ import { Dialog } from "./ui/Dialog";
 import { Guide } from "./ui/Guide";
 
 type Screen = "menu" | "play" | "dead" | "won";
-type Modal = "inventory" | "guide" | "audio" | null;
+type Modal = "inventory" | "guide" | "audio" | "journal" | null;
 
 function readSetting(key: string) {
   try { return localStorage.getItem(key); } catch { return null; }
@@ -59,12 +61,28 @@ export default function App() {
   const [musicMuted, setMusicMuted] = useState(() => readSetting("blok7-music-mute") === "1");
   const [full, setFull] = useState(false);
   const [fullscreenError, setFullscreenError] = useState("");
-  const [session, setSession] = useState<{ seed: number; id: number; slots: Slots } | null>(null);
+  const [session, setSession] = useState<{ seed: number; id: number; slots: Slots; saved?: RunCheckpoint } | null>(null);
+  const [canResume, setCanResume] = useState(() => !!parseCheckpoint(readSetting(CHECKPOINT_KEY)));
+  const checkpoint = useRef<RunCheckpoint | null>(null);
   const canvas = useRef<HTMLCanvasElement>(null);
   const game = useRef<Game | null>(null);
   const previewSound = useRef<Sfx | null>(null);
   const soundPrefs = useRef({ muted, musicMuted });
   soundPrefs.current = { muted, musicMuted };
+
+  const saveRun = useCallback((g: Game | null) => {
+    const saved = g?.checkpoint();
+    if (!saved) return;
+    checkpoint.current = saved;
+    saveSetting(CHECKPOINT_KEY, JSON.stringify(saved));
+    setCanResume(true);
+  }, []);
+
+  const clearRun = useCallback(() => {
+    checkpoint.current = null;
+    saveSetting(CHECKPOINT_KEY, "");
+    setCanResume(false);
+  }, []);
 
   useEffect(() => {
     saveSetting("blok7-mute", muted ? "1" : "0");
@@ -77,9 +95,11 @@ export default function App() {
   useEffect(() => {
     if (!session || !canvas.current) return;
     const g = new Game(canvas.current, {
-      onHud: setHud, onPause: setPaused,
+      onHud: setHud, onPause: p => { setPaused(p); if (p) saveRun(g); },
       onInventory: open => setModal(open ? "inventory" : null),
+      onJournal: () => { g.setPaused(true); setModal("journal"); },
       onEnd: s => {
+        clearRun();
         const old = Number(readSetting("blok7-best")) || 0;
         const high = Math.max(old, s.score);
         saveSetting("blok7-best", String(high));
@@ -92,11 +112,19 @@ export default function App() {
       (window as unknown as { game?: Game }).game = g;
     }
     g.setMuted(soundPrefs.current.muted); g.setMusicMuted(soundPrefs.current.musicMuted);
-    g.start(session.seed, session.slots);
+    g.start(session.seed, session.slots, session.saved);
     function onHidden() { if (document.hidden) g.setPaused(true); }
+    const save = () => saveRun(g);
+    const autosave = window.setInterval(save, 8000);
     document.addEventListener("visibilitychange", onHidden);
-    return () => { document.removeEventListener("visibilitychange", onHidden); g.destroy(); game.current = null; };
-  }, [session]);
+    window.addEventListener("pagehide", save);
+    return () => {
+      document.removeEventListener("visibilitychange", onHidden);
+      window.removeEventListener("pagehide", save);
+      window.clearInterval(autosave);
+      g.destroy(); game.current = null;
+    };
+  }, [session, saveRun, clearRun]);
 
   useEffect(() => {
     const onFull = () => setFull(!!document.fullscreenElement);
@@ -104,12 +132,32 @@ export default function App() {
     return () => { document.removeEventListener("fullscreenchange", onFull); previewSound.current?.destroy(); };
   }, []);
 
-  function begin(same = false) {
+  function begin(same = false, saved?: RunCheckpoint) {
+    if (!saved) clearRun();
     previewSound.current?.destroy(); previewSound.current = null;
     setScreen("play"); setModal(null); setPaused(false); setHud(null); setStats(null); setChosen(undefined);
-    setSession(previous => ({ seed: same && previous ? previous.seed : crypto.getRandomValues(new Uint32Array(1))[0], id: (previous?.id ?? 0) + 1, slots: [...pack.slots] }));
+    setSession(previous => {
+      let seed = saved?.seed ?? (same && previous ? previous.seed : crypto.getRandomValues(new Uint32Array(1))[0]);
+      if (!saved && !same) {
+        const last = readSetting("blok7-layout-profile");
+        for (let n = 0; n < 12; n++) {
+          const p = layoutProfile(seed);
+          if (`${p.family}:${p.start}` !== last) break;
+          seed = crypto.getRandomValues(new Uint32Array(1))[0];
+        }
+        const p = layoutProfile(seed);
+        saveSetting("blok7-layout-profile", `${p.family}:${p.start}`);
+      }
+      return { seed, id: (previous?.id ?? 0) + 1, slots: [...pack.slots], saved };
+    });
+  }
+  function resumeRun() {
+    const saved = checkpoint.current ?? parseCheckpoint(readSetting(CHECKPOINT_KEY));
+    if (saved) begin(false, saved);
+    else setCanResume(false);
   }
   function toMenu() {
+    if (screen === "play") saveRun(game.current);
     setSession(null); setHud(null); setPaused(false); setModal(null); setScreen("menu");
   }
   function openPack(id?: WeaponId) {
@@ -119,8 +167,13 @@ export default function App() {
   }
   const closeModal = useCallback(() => {
     if (game.current && modal === "inventory") game.current.setInventory(false);
+    if (game.current && modal === "journal") game.current.setPaused(false);
     setModal(null); setChosen(undefined);
   }, [modal]);
+  function openJournal() {
+    game.current?.setPaused(true);
+    setModal("journal");
+  }
   const assign = useCallback((slot: number, id: WeaponId | null) => {
     if (game.current) { game.current.assignWeapon(slot, id); return; }
     setPack(current => {
@@ -179,6 +232,7 @@ export default function App() {
             <button className="action-secondary" onClick={() => setModal("guide")}>STEROWANIE</button>
           </div>
           <nav className="hero-links" aria-label="Menu">
+            {canResume && <button onClick={resumeRun}><Icon name="play" size={15} /> Wznów wyprawę</button>}
             <button onClick={() => openPack()}><Icon name="pack" size={15} /> Ekwipunek</button>
             {best > 0 && <em>Rekord {String(best).padStart(6, "0")}</em>}
           </nav>
@@ -191,7 +245,7 @@ export default function App() {
       <canvas ref={canvas} aria-label="BLOK 7: plansza gry. WASD: ruch, E: interakcja i ukrywanie, F: latarka, Tab: ekwipunek." />
       <div className={`vignette ${hud?.lowHp ? "danger" : ""}`}/>
       {screen === "play" && hud && <>
-        <Hud hud={hud} onInventory={() => openPack()} onSlot={i => game.current?.selectSlot(i)} onPause={() => game.current?.setPaused(true)} onInteract={() => game.current?.touchTap("interact")} onChoose={i => game.current?.chooseOption(i)}
+        <Hud hud={hud} onInventory={() => openPack()} onJournal={openJournal} onSlot={i => game.current?.selectSlot(i)} onPause={() => game.current?.setPaused(true)} onInteract={() => game.current?.touchTap("interact")} onHold={on => game.current?.setTouchHold(on)} onChoose={i => game.current?.chooseOption(i)}
           onHint={action => {
             if (action === "flash") game.current?.touchTap("flash");
             if (action === "interact") game.current?.touchTap("interact");
@@ -200,7 +254,7 @@ export default function App() {
         {!paused && !modal && <div className="touch"><Stick onChange={(x,y) => { game.current?.setTouchMove(x,y); if (Math.hypot(x,y)>0.1) game.current?.setTouchAim(x,y); }}/>
           <div className="touch-actions"><button onClick={() => game.current?.touchTap("flash")}>Latarka</button><button onClick={() => game.current?.touchTap("reload")}>Przeładuj</button>
           <button className="touch-attack" onPointerDown={e => { e.currentTarget.setPointerCapture(e.pointerId); game.current?.setTouchFire(true); }} onPointerUp={() => game.current?.setTouchFire(false)} onPointerCancel={() => game.current?.setTouchFire(false)}>Atak</button>
-          <button onPointerDown={e => { e.currentTarget.setPointerCapture(e.pointerId); game.current?.setTouchHold(true); }} onPointerUp={() => game.current?.setTouchHold(false)} onPointerCancel={() => game.current?.setTouchHold(false)}>Użyj</button></div></div>}
+           <button onPointerDown={e => { e.currentTarget.setPointerCapture(e.pointerId); game.current?.setTouchHold(true); }} onPointerUp={() => game.current?.setTouchHold(false)} onPointerCancel={() => game.current?.setTouchHold(false)} onLostPointerCapture={() => game.current?.setTouchHold(false)}>Użyj</button></div></div>}
       </>}
       {screen === "play" && paused && !modal && <Dialog title="Pauza" eyebrow="BLOK 7 / CHWILA CISZY" onClose={() => game.current?.setPaused(false)}>
         <p className="dialog-intro">{hud?.floorName} · Czas przetrwania: {duration(hud?.time ?? 0)}</p>
@@ -208,12 +262,19 @@ export default function App() {
           <button className="action-secondary" onClick={() => openPack()}><Icon name="pack"/>EKWIPUNEK</button>
           <button className="action-secondary" onClick={audioSettings}><Icon name="volume"/>DŹWIĘK</button>
           <button className="action-secondary" onClick={() => setModal("guide")}><Icon name="book"/>PORADNIK</button></div>
-        <button className="abandon" onClick={toMenu}>Zakończ wyprawę i wróć do menu<Icon name="arrow" size={14}/></button>
+         <button className="abandon" onClick={toMenu}>Zapisz i wróć do menu<Icon name="arrow" size={14}/></button>
       </Dialog>}
     </div>}
 
     {modal === "inventory" && <Inventory pack={screen === "play" && hud ? hud.inventory : pack} initial={chosen} onAssign={assign} onClose={closeModal} playing={screen === "play"}/>}
     {modal === "guide" && <Guide onClose={closeModal}/>}
+    {modal === "journal" && hud && <Dialog title="Dziennik ocalałego" eyebrow="BLOK 7 / ZAPISANE WSKAZÓWKI" onClose={closeModal}>
+      {hud.quest && <section className="journal-current"><span className="micro">AKTUALNE ZADANIE</span><h3>{hud.quest.title}</h3><p>{hud.quest.step}</p></section>}
+      <ol className="journal-entries" aria-label="Historia odkrytych wskazówek">
+        {[...hud.journal].reverse().map((entry, i) => <li key={`${entry}-${i}`}>{entry}</li>)}
+      </ol>
+      <footer className="dialog-bottom"><span className="micro">WIEDZA ZAPISYWANA W TEJ WYPRAWIE</span><button className="action-primary small" onClick={closeModal}>WRÓĆ DO GRY<Icon name="check" size={15}/></button></footer>
+    </Dialog>}
     {modal === "audio" && <Dialog title="Dźwięk" eyebrow="BLOK 7 / USTAWIENIA" onClose={closeModal}>
       <div className="audio-settings"><div><span><Icon name="volume"/><b>Dźwięk gry</b></span><button role="switch" aria-label="Dźwięk gry" aria-checked={!muted} className="toggle" onClick={() => setMuted(v=>!v)}><i/>{muted ? "WYŁ." : "WŁ."}</button></div>
         <div><span><Icon name="music"/><b>Muzyka w tle</b></span><button role="switch" aria-label="Muzyka w tle" aria-checked={!musicMuted} className="toggle" onClick={() => setMusicMuted(v=>!v)}><i/>{musicMuted ? "WYŁ." : "WŁ."}</button></div></div>

@@ -1,9 +1,35 @@
 import { Sfx } from "./audio";
+import { CHECKPOINT_VERSION, type RunCheckpoint, type SavedFloor } from "./checkpoint";
+import { createEnvironmentState, Environment, heroId, type EnvironmentState, type EnvironmentWorld } from "./environment";
+import { drawEnvironmentGround, drawEnvironmentSignals, environmentProps } from "./environment-art";
 import { EventDirector, type EventWorld, type Resource } from "./events";
+import { createTacticalState, TacticalDirector, type Stimulus, type TacticalState } from "./tactical";
+import { noiseLabel, TACTICAL } from "./tactical-config";
+import { drawCrawler, drawTacticalProps, isTacticalProp } from "./tactical-art";
+import {
+  defaultFloorQuestState,
+  initialBuildingState,
+  makeBuildingPlan,
+  type BuildingPlan,
+  type BuildingState,
+  type Cell,
+  type FloorQuestState,
+  type PassageState,
+} from "./vertical-layout";
+import {
+  PASSAGE_H,
+  PASSAGE_W,
+  drawLiftRideScene,
+  drawPassageMinimap,
+  drawPassageScene,
+  drawVerticalWorld,
+  floorShortName,
+  floorTag,
+} from "./vertical-scene";
 import { WEAPONS, assignSlot, copyInventory, discover, isWeapon, starterInventory, type Slots, type WeaponId } from "./inventory";
 import { generateFloor } from "./generate";
 import { astar } from "./path";
-import { COL, FLOOR_COUNT, TILE } from "./palette";
+import { COL, FLOOR_COUNT, TILE, Tile } from "./palette";
 import { SurvivorRig } from "./rig";
 import { Art, drawSkyTile, pixLine, type Dir } from "./sprites";
 import type { DoorInfo, FloorData, HudState, Prop, RunStats, WallDecal, ZombieKind } from "./types";
@@ -13,6 +39,7 @@ export interface GameHooks {
   onEnd: (s: RunStats) => void;
   onPause: (p: boolean) => void;
   onInventory?: (open: boolean) => void;
+  onJournal?: () => void;
 }
 
 interface Zombie {
@@ -44,6 +71,18 @@ interface Zombie {
   id: number;
   screamer: boolean;
   reinforcement: boolean;
+  missionTag?: "lure";
+  stimulus: "player" | "device" | "noise" | null;
+  stimulusUntil: number;
+  searchT: number;
+  patrol: { x: number; y: number }[];
+  patrolIndex: number;
+  patrolPause: number;
+  grabWindup: number;
+  grabCd: number;
+  downT: number;
+  bisected: boolean;
+  seenWardrobe: { x: number; y: number } | null;
 }
 
 interface Bullet {
@@ -124,6 +163,9 @@ interface LiveFloor {
   hasKey: boolean;
   blood: { x: number; y: number; n: number; seed: number }[];
   shells: Shell[];
+  environment: EnvironmentState;
+  tactical: TacticalState;
+  director?: EventDirector;
 }
 
 const ZT: Record<ZombieKind, { hp: number; speed: number; dmg: number; every: number; r: number }> = {
@@ -131,6 +173,7 @@ const ZT: Record<ZombieKind, { hp: number; speed: number; dmg: number; every: nu
   runner: { hp: 30, speed: 62, dmg: 10, every: 0.58, r: 4.6 },
   brute: { hp: 118, speed: 22, dmg: 24, every: 1.12, r: 6.1 },
   boss: { hp: 640, speed: 27, dmg: 30, every: 1.25, r: 9 },
+  crawler: { hp: 18, speed: 18, dmg: 6, every: 1.1, r: 3.5 },
 };
 
 function angDiff(a: number, b: number) {
@@ -178,6 +221,12 @@ export class Game {
   private floorIndex = 0;
   private floor: LiveFloor | null = null;
   private lives: (LiveFloor | null)[] = [];
+  private restored: (SavedFloor | null)[] = [];
+  private generatorVersion: 1 | 2 = 2;
+  private building: BuildingState = initialBuildingState();
+  private buildingLayout: BuildingPlan = makeBuildingPlan(1);
+  private verticalChoice: { targets: (number | null)[]; labels: string[]; label: string; text: string; mode?: "service" } | null = null;
+  private verticalWork: { label: string; progress: number; active: boolean } | null = null;
   private px = 0;
   private py = 0;
   private hp = 100;
@@ -197,6 +246,7 @@ export class Game {
   private recoil = 0;
   private invuln = 0;
   private hurt = 0;
+  private environmentHit = false;
   private battery = 100;
   private flashOn = true;
   private hasKey = false;
@@ -249,6 +299,14 @@ export class Game {
   private popups: PopBubble[] = [];
   private activeDialog: { npc: LiveSurvivor; lineIdx: number; charIdx: number; whisperT: number } | null = null;
   private director: EventDirector | null = null;
+  private environment: Environment | null = null;
+  private tactical: TacticalDirector | null = null;
+  private grabbedBy: number | null = null;
+  private grabStruggles = 0;
+  private grabTick = 0;
+  private grabProtection = 0;
+  private npcWait: number = TACTICAL.npc.firstDelay;
+  private npcSeenCount = 0;
   private zid = 1;
   private hideReturn = { x: 0, y: 0 };
   private wasHidden = false;
@@ -290,16 +348,21 @@ export class Game {
     }
   }
 
-  start(seed: number, slots?: Slots) {
+  start(seed: number, slots?: Slots, saved?: RunCheckpoint) {
     this.seed = seed >>> 0;
-    this.time = 0;
-    this.kills = 0;
-    this.hp = 100;
-    this.stamina = 100;
-    this.pack = starterInventory(slots);
+    this.generatorVersion = saved ? saved.generatorVersion ?? 1 : 2;
+    this.building = saved ? structuredClone(saved.building) : initialBuildingState();
+    this.buildingLayout = makeBuildingPlan(this.seed);
+    this.verticalChoice = null;
+    this.verticalWork = null;
+    this.time = saved?.time ?? 0;
+    this.kills = saved?.kills ?? 0;
+    this.hp = saved?.hero.hp ?? 100;
+    this.stamina = saved?.hero.stamina ?? 100;
+    this.pack = saved ? copyInventory(saved.pack) : starterInventory(slots);
     this.inventoryOpen = false;
-    this.battery = 100;
-    this.flashOn = true;
+    this.battery = saved?.hero.battery ?? 100;
+    this.flashOn = saved?.hero.flash ?? true;
     this.autoFlash = false;
     this.darknessContext = null;
     this.dead = false;
@@ -307,14 +370,48 @@ export class Game {
     this.ended = false;
     this.heliPhase = null;
     this.heliT = 0;
-    this.bossKilled = false;
+    this.bossKilled = saved?.bossKilled ?? false;
     this.bossWarned = false;
     this.popups = [];
     this.activeDialog = null;
     this.lives = [];
-    this.enter(0, "start");
+    this.restored = saved ? [...saved.floors] : [];
+    this.enter(saved?.floor ?? 0, "start");
+    if (saved) {
+      this.px = saved.hero.x;
+      this.py = saved.hero.y;
+      this.unstuck();
+      this.camX = this.px - this.viewW / 2;
+      this.camY = this.py - this.viewH / 2;
+      this.say("Wyprawa wznowiona. Rozejrzyj si\u0119, zanim ruszysz dalej.");
+    }
     this.last = performance.now();
     this.loop(this.last);
+  }
+
+  checkpoint(): RunCheckpoint | null {
+    if (!this.floor || this.dead || this.won || this.ended) return null;
+    const floors = Array.from({ length: FLOOR_COUNT }, (_, i): SavedFloor | null => {
+      const f = this.lives[i];
+      if (!f) return this.restored[i] ?? null;
+      return {
+        layout: f.data.seed,
+        hasKey: i === this.floorIndex ? this.hasKey : f.hasKey,
+        environment: { clock: f.environment.clock, features: Object.fromEntries(Object.entries(f.environment.features).map(([id, s]) => [id, { ...s }])) },
+        explored: f.explored.join(""),
+        opened: f.data.props.filter((p) => p.opened).map((p) => p.id),
+        survivorsGone: f.survivors.filter((s) => s.state === "flee" || s.state === "gone").map((s) => s.id),
+        doors: f.data.doors.map((d) => ({ ...d })),
+        zombies: f.zombies.map(({ x, y, hp, home, kind, state, alertT, lastX, lastY, screamer, reinforcement, missionTag, downT, bisected, seenWardrobe }) =>
+          ({ x, y, hp, home, kind, state, alertT, lastX, lastY, screamer, reinforcement,
+            ...(missionTag ? { missionTag } : {}), downT, bisected, seenWardrobe: seenWardrobe ? { ...seenWardrobe } : null })),
+        tactical: structuredClone(f.tactical),
+      };
+    });
+    const pos = this.director?.hidden ? this.hideReturn : { x: this.px, y: this.py };
+    return { version: CHECKPOINT_VERSION, generatorVersion: this.generatorVersion, seed: this.seed, floor: this.floorIndex, time: this.time, kills: this.kills,
+      hero: { ...pos, hp: this.hp, stamina: this.stamina, battery: this.battery, flash: this.flashOn },
+      pack: copyInventory(this.pack), bossKilled: this.bossKilled, building: structuredClone(this.building), floors };
   }
 
   destroy() {
@@ -354,6 +451,7 @@ export class Game {
     this.keys.clear();
     this.mouseDown = this.touchFire = this.touchHold = false;
     this.touchMove = { x: 0, y: 0 };
+    this.environment?.cancelWork();
   }
 
   setInventory(open: boolean) {
@@ -400,6 +498,7 @@ export class Game {
 
   setTouchHold(on: boolean) {
     this.touchHold = on;
+    if (on && this.grabbedBy !== null) { this.struggleGrab(); return; }
     if (on) this.interact();
     this.sfx.unlock();
   }
@@ -408,7 +507,9 @@ export class Game {
     this.sfx.unlock();
     if (this.paused || this.dead || this.won) return;
     if (action === "melee") this.melee();
-    if (action === "interact") this.interact();
+    if (action === "interact") {
+      if (this.grabbedBy !== null) this.struggleGrab(); else this.interact();
+    }
     if (action === "flash") this.toggleFlash();
     if (action === "reload") this.startReload();
     if (action === "switch") this.switchWeapon();
@@ -459,9 +560,22 @@ export class Game {
       this.setInventory(!this.inventoryOpen);
       return;
     }
+    if (this.grabbedBy !== null) {
+      if (e.code === "KeyE" && !e.repeat) { e.preventDefault(); this.struggleGrab(); }
+      else if (e.code === "Escape" && !e.repeat) this.togglePause();
+      return;
+    }
     if (this.inventoryOpen) {
       if (e.code === "Escape") { e.preventDefault(); this.setInventory(false); }
       else if (e.code === "KeyI" && !e.repeat) { e.preventDefault(); this.setInventory(false); }
+      return;
+    }
+    if (this.verticalChoice) {
+      if (e.code === "Tab") return;
+      e.preventDefault();
+      if (/^Digit[123]$/.test(e.code)) this.chooseOption(Number(e.code.slice(-1)) - 1);
+      else if (e.code === "Escape") this.chooseOption(this.verticalChoice.targets.length - 1);
+      else if (e.code === "KeyE" || e.code === "Enter") this.chooseOption(0);
       return;
     }
     if (this.director?.choice) {
@@ -472,7 +586,7 @@ export class Game {
       else if (e.code === "KeyE" || e.code === "Enter" || e.code === "Space") this.chooseOption(0);
       return;
     }
-    const block = ["Tab", "Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "KeyE", "KeyR", "KeyF", "KeyH"];
+    const block = ["Tab", "Space", "ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", "KeyE", "KeyR", "KeyF", "KeyH", "KeyJ"];
     if (block.includes(e.code)) e.preventDefault();
     if (e.code === "Escape") {
       e.preventDefault();
@@ -485,6 +599,7 @@ export class Game {
     }
     this.keys.add(e.code);
     if (this.paused || this.dead || this.won) return;
+    if (e.code === "KeyJ") { this.hooks.onJournal?.(); return; }
     if (e.code === "KeyE") this.interact();
     if (e.code === "KeyF") this.toggleFlash();
     if (e.code === "KeyR") this.startReload();
@@ -530,9 +645,13 @@ export class Game {
   }
 
   private solidTile(tx: number, ty: number) {
+    return this.solidBaseTile(tx, ty) || (this.environment?.blocksTile(tx, ty) ?? false);
+  }
+
+  private solidBaseTile(tx: number, ty: number) {
     if (!this.inb(tx, ty)) return true;
     const t = this.tileAt(tx, ty);
-    if (t === 0 || t === 6 || t === 9 || t === 2) return true;
+    if (t === Tile.Wall || t === Tile.Window || t === Tile.Sky || t === Tile.Door || t === Tile.Hole) return true;
     if (this.propSolid[this.idx(tx, ty)]) return true;
     return false;
   }
@@ -548,9 +667,9 @@ export class Game {
     return false;
   }
 
-  private shoveOut(x: number, y: number, r: number) {
+  private shoveOut(x: number, y: number, r: number, limit = 14) {
     if (this.canOccupy(x, y, r)) return { x, y };
-    for (let rad = 1; rad <= 14; rad++) {
+    for (let rad = 1; rad <= limit; rad++) {
       for (let i = 0; i < 8; i++) {
         const a = (i / 8) * Math.PI * 2;
         const nx = x + Math.cos(a) * rad;
@@ -566,19 +685,22 @@ export class Game {
       const a = (i / 8) * Math.PI * 2;
       const tx = Math.floor((x + Math.cos(a) * r) / TILE);
       const ty = Math.floor((y + Math.sin(a) * r) / TILE);
-      if (this.solidTile(tx, ty)) return false;
+      if (this.solidBaseTile(tx, ty)) return false;
     }
-    return !this.solidTile(Math.floor(x / TILE), Math.floor(y / TILE));
+    return !this.solidBaseTile(Math.floor(x / TILE), Math.floor(y / TILE)) && !this.environment?.blocksBody(x, y, r);
   }
 
   private moveBody(x: number, y: number, r: number, dx: number, dy: number) {
     let nx = x;
     let ny = y;
-    if (this.canOccupy(x + dx, y, r)) nx = x + dx;
-    if (this.canOccupy(nx, y + dy, r)) ny = y + dy;
+    // A live jet stops entry into its core, but a caught actor can still retreat.
+    const caughtInSteam = this.environment?.inSteam(x, y);
+    const canStep = (tx: number, ty: number) => this.canOccupy(tx, ty, r) && (caughtInSteam || !this.environment?.inSteam(tx, ty));
+    if (canStep(x + dx, y)) nx = x + dx;
+    if (canStep(nx, y + dy)) ny = y + dy;
     if (nx === x && ny === y && (dx !== 0 || dy !== 0)) {
-      if (this.canOccupy(x + Math.sign(dx) * 0.8, y, r)) nx = x + Math.sign(dx) * 0.8;
-      if (this.canOccupy(x, y + Math.sign(dy) * 0.8, r)) ny = y + Math.sign(dy) * 0.8;
+      if (canStep(x + Math.sign(dx) * 0.8, y)) nx = x + Math.sign(dx) * 0.8;
+      if (canStep(x, y + Math.sign(dy) * 0.8)) ny = y + Math.sign(dy) * 0.8;
     }
     const tx = Math.floor(nx / TILE);
     const ty = Math.floor(ny / TILE);
@@ -586,8 +708,9 @@ export class Game {
     const right = this.solidTile(tx + 1, ty);
     const up = this.solidTile(tx, ty - 1);
     const down = this.solidTile(tx, ty + 1);
-    if (left && right && !up && !down) nx += ((tx + 0.5) * TILE - nx) * 0.45;
-    if (up && down && !left && !right) ny += ((ty + 0.5) * TILE - ny) * 0.45;
+    const gx = left && right && !up && !down ? nx + ((tx + 0.5) * TILE - nx) * 0.45 : nx;
+    const gy = up && down && !left && !right ? ny + ((ty + 0.5) * TILE - ny) * 0.45 : ny;
+    if ((gx !== nx || gy !== ny) && canStep(gx, gy)) return { x: gx, y: gy };
     return { x: nx, y: ny };
   }
 
@@ -605,7 +728,7 @@ export class Game {
     return s;
   }
 
-  private makeZombie(s: { x: number; y: number; kind: ZombieKind; room: number }): Zombie {
+  private makeZombie(s: { x: number; y: number; kind: ZombieKind; room: number; missionTag?: Zombie["missionTag"] }): Zombie {
     const st = ZT[s.kind];
     const mult = s.kind === "boss" ? 1 : 1 + this.floorIndex * 0.05;
     return {
@@ -637,6 +760,23 @@ export class Game {
       id: this.zid++,
       screamer: s.kind !== "boss" && Math.random() < 0.24,
       reinforcement: false,
+      ...(s.missionTag ? { missionTag: s.missionTag } : {}),
+      stimulus: null,
+      stimulusUntil: 0,
+      searchT: 0,
+      patrol: this.floor?.data.roomZones[s.room] === "KORYTARZ" && this.floor.data.rooms[s.room]
+        ? [0.15, 0.5, 0.85].map((part) => ({
+            x: this.floor!.data.rooms[s.room].x + Math.max(1, Math.floor(this.floor!.data.rooms[s.room].w * part)),
+            y: this.floor!.data.rooms[s.room].y + 1,
+          }))
+        : [],
+      patrolIndex: Math.floor(Math.random() * 3),
+      patrolPause: Math.random() * 2,
+      grabWindup: 0,
+      grabCd: 2 + Math.random() * 5,
+      downT: 0,
+      bisected: s.kind === "crawler",
+      seenWardrobe: null,
     };
   }
 
@@ -655,6 +795,231 @@ export class Game {
     z.lastY = this.py;
     z.alertT = 8;
     this.floor.zombies.push(z);
+  }
+
+  private tacticalHint(): string {
+    if (!this.floor || !this.tactical) return "";
+    for (const p of this.data().props) {
+      if (p.kind !== "radio" && p.kind !== "tv") continue;
+      if (!this.closeEnough({ x: p.x, y: p.y }, 25)) continue;
+      const d = this.tactical.ensureDevice(p.id, p.kind, (p.x + 0.5) * TILE, (p.y + 0.5) * TILE);
+      return `E  ${d.on ? "wyłącz" : "włącz"} ${p.kind === "tv" ? "telewizor" : "radio"}`;
+    }
+    return "";
+  }
+
+  private interactTactical(): boolean {
+    if (!this.floor || !this.tactical) return false;
+    for (const p of this.data().props) {
+      if ((p.kind !== "radio" && p.kind !== "tv") || !this.closeEnough({ x: p.x, y: p.y }, 25)) continue;
+      const d = this.tactical.ensureDevice(p.id, p.kind, (p.x + 0.5) * TILE, (p.y + 0.5) * TILE);
+      this.tactical.setDevice(p.id, !d.on);
+      this.sfx.device(p.kind, d.on);
+      this.interactLock = 0.2;
+      this.say(`${p.kind === "tv" ? "Telewizor" : "Radio"} ${d.on ? "włączone — źródło hałasu w tym pomieszczeniu." : "wyłączone. Pobudzenie opadnie stopniowo."}`);
+      return true;
+    }
+    return false;
+  }
+
+  private updateTactical(dt: number) {
+    if (!this.floor || !this.tactical) return;
+    for (const p of this.data().props) {
+      if (p.kind === "radio" || p.kind === "tv") this.tactical.ensureDevice(p.id, p.kind, (p.x + 0.5) * TILE, (p.y + 0.5) * TILE);
+      if (p.kind === "explosive") this.tactical.ensureBarrel(p.id);
+    }
+    this.tactical.update(dt, (device) => {
+      if (Math.hypot(device.x - this.px, device.y - this.py) < 12 * TILE) this.sfx.device(device.kind, true);
+    }, (source) => this.spawnTacticalWave(source), () => {
+      const cap = Math.min(TACTICAL.waves.populationMax,
+        TACTICAL.waves.basePopulation + Math.floor(this.data().rooms.length / 5) * TACTICAL.waves.populationPerFiveRooms);
+      const alive = this.floor!.zombies.filter((z) => z.state !== "dead").length;
+      return alive >= cap || this.tactical!.state.waveBudget < TACTICAL.waves.budgetPerZombie || this.floorIndex >= 10;
+    });
+    for (const p of this.data().props) {
+      if (p.kind !== "explosive") continue;
+      const b = this.tactical.state.barrels[p.id];
+      if (b?.stage === "warning") {
+        b.fuse = Math.max(0, b.fuse - dt);
+        if (b.fuse <= 0) this.explodeBarrel(p.id);
+      }
+    }
+    this.noise = this.tactical.state.playerNoise / 100;
+    this.scheduleNpc(dt);
+  }
+
+  private spawnTacticalWave(source: Stimulus): number {
+    if (!this.floor || !this.tactical) return 0;
+    const alive = this.floor.zombies.filter((z) => z.state !== "dead").length;
+    const cap = Math.min(TACTICAL.waves.populationMax, TACTICAL.waves.basePopulation + Math.floor(this.data().rooms.length / 5));
+    const room = Math.max(0, Math.min(TACTICAL.waves.maxPerWave, cap - alive, Math.floor(this.tactical.state.waveBudget / TACTICAL.waves.budgetPerZombie)));
+    if (room <= 0) return 0;
+    const d = this.data();
+    const escort = this.director?.escortActive ? this.director.civ(this.director.escortId) : null;
+    const candidates: { x: number; y: number }[] = [];
+    for (let y = 2; y < d.h - 2; y++) for (let x = 2; x < d.w - 2; x++) {
+      const i = this.idx(x, y);
+      if (!this.walkable(x, y, false) || this.vis[i]) continue;
+      const wx = (x + 0.5) * TILE, wy = (y + 0.5) * TILE;
+      const pd = Math.hypot(wx - this.px, wy - this.py);
+      if (pd < TACTICAL.waves.spawnMinDistance || pd > TACTICAL.waves.spawnMaxDistance) continue;
+      if (d.props.some((p) => p.solid && x >= p.x && x < p.x + p.w && y >= p.y && y < p.y + p.h)) continue;
+      if (this.director?.hidden && Math.hypot(wx - this.px, wy - this.py) < 6 * TILE) continue;
+      if (escort && Math.hypot(wx - escort.x, wy - escort.y) < TACTICAL.waves.npcSafeDistance) continue;
+      candidates.push({ x, y });
+    }
+    // Prefer stairwells and side corridors, then other reachable rooms.
+    candidates.sort((a, b) => {
+      const ar = d.roomOf[this.idx(a.x, a.y)], br = d.roomOf[this.idx(b.x, b.y)];
+      const az = ar >= 0 ? d.roomZones[ar] : "", bz = br >= 0 ? d.roomZones[br] : "";
+      return Number(bz.includes("KLATKA") || bz === "KORYTARZ") - Number(az.includes("KLATKA") || az === "KORYTARZ") || Math.random() - 0.5;
+    });
+    let spawned = 0;
+    for (const c of candidates) {
+      const from = { x: Math.floor(c.x), y: Math.floor(c.y) };
+      const to = { x: Math.floor(source.x / TILE), y: Math.floor(source.y / TILE) };
+      const path = astar(d.w, d.h, from.x, from.y, to.x, to.y, (x, y) => this.walkable(x, y, false));
+      if (!path?.length) continue;
+      const z = this.makeZombie({ x: (c.x + 0.5) * TILE, y: (c.y + 0.5) * TILE, kind: spawned === 0 && this.tactical.state.arousal > 65 ? "runner" : "shambler", room: d.roomOf[this.idx(c.x, c.y)] });
+      z.reinforcement = true;
+      z.screamer = false;
+      z.state = "chase";
+      z.stimulus = source.source === "device" ? "device" : "noise";
+      z.stimulusUntil = this.tactical.clock + 8;
+      z.lastX = source.x; z.lastY = source.y;
+      z.alertT = 10;
+      this.floor.zombies.push(z);
+      if (++spawned >= room) break;
+    }
+    if (spawned) this.say("Słyszysz kolejne kroki w budynku. Hałas ściągnął posiłki.");
+    return spawned;
+  }
+
+  private armBarrel(id: number, melee: boolean) {
+    if (!this.tactical) return false;
+    const b = this.tactical.ensureBarrel(id);
+    if (b.stage !== "idle") return false;
+    b.stage = "warning";
+    b.fuse = melee ? TACTICAL.barrels.meleeFuse : TACTICAL.barrels.bulletFuse;
+    this.sfx.environment("arc", 0.8);
+    return true;
+  }
+
+  private hitBarrelAt(x: number, y: number, melee: boolean) {
+    const p = this.data().props.find((prop) => prop.kind === "explosive" && this.tactical?.state.barrels[prop.id]?.stage !== "spent"
+      && Math.hypot((prop.x + 0.5) * TILE - x, (prop.y + 0.5) * TILE - y) < (melee ? 18 : 7));
+    return p ? this.armBarrel(p.id, melee) : false;
+  }
+
+  private explodeBarrel(id: number) {
+    if (!this.floor || !this.tactical) return;
+    const b = this.tactical.state.barrels[id];
+    const p = this.data().props.find((prop) => prop.id === id);
+    if (!p || !b || b.stage === "spent") return;
+    b.stage = "spent";
+    p.opened = true;
+    const x = (p.x + 0.5) * TILE, y = (p.y + 0.5) * TILE;
+    this.sfx.explosion();
+    this.shake = Math.max(this.shake, 7);
+    this.burst(x, y, "#ffb34f", 28, 130, true);
+    this.burst(x, y, "#5e4235", 20, 85);
+    this.data().decals.push({ x: p.x, y: p.y, kind: "scorch" });
+    this.tactical.emit(x, y, TACTICAL.noise.barrel, 30 * TILE, 4, 38, "world");
+    this.alert(x, y, 28 * TILE, true);
+    const radius = TACTICAL.barrels.radius;
+    if (!this.director?.hidden && Math.hypot(this.px - x, this.py - y) < radius && this.rayClear(p.x, p.y, Math.floor(this.px / TILE), Math.floor(this.py / TILE))) {
+      this.damagePlayer(TACTICAL.barrels.playerDamage * (1 - Math.hypot(this.px - x, this.py - y) / (radius * 1.4)), x, y, true);
+    }
+    for (const z of this.floor.zombies) {
+      if (z.state === "dead") continue;
+      const dist = Math.hypot(z.x - x, z.y - y);
+      if (dist > radius || !this.rayClear(p.x, p.y, Math.floor(z.x / TILE), Math.floor(z.y / TILE))) continue;
+      this.hurtZombie(z, TACTICAL.barrels.zombieDamage * (1 - dist / (radius * 1.35)), z.x - x, z.y - y);
+      if (z.hp > 0) z.downT = Math.max(z.downT, 1.25);
+    }
+    for (const civ of this.director?.civilians() ?? []) {
+      if (civ.state === "dead" || civ.state === "gone") continue;
+      const dist = Math.hypot(civ.x - x, civ.y - y);
+      if (dist < radius && this.rayClear(p.x, p.y, Math.floor(civ.x / TILE), Math.floor(civ.y / TILE))) {
+        this.director?.hurtCiv(civ, 60 * (1 - dist / (radius * 1.4)), civ.x - x, civ.y - y, false);
+      }
+    }
+    // Chain reaction is scheduled once per other barrel and obeys wall occlusion.
+    for (const other of this.data().props) {
+      if (other.kind !== "explosive" || other.id === id) continue;
+      const otherState = this.tactical.state.barrels[other.id];
+      if (!otherState || otherState.stage !== "idle") continue;
+      if (Math.hypot((other.x - p.x) * TILE, (other.y - p.y) * TILE) < TACTICAL.barrels.chainRadius
+        && this.rayClear(p.x, p.y, other.x, other.y)) {
+        otherState.stage = "warning";
+        otherState.fuse = TACTICAL.barrels.chainFuse;
+      }
+    }
+  }
+
+  private struggleGrab() {
+    if (this.grabbedBy === null) return;
+    const z = this.zombieById(this.grabbedBy);
+    if (!z || z.state === "dead") { this.grabbedBy = null; return; }
+    this.grabStruggles = Math.min(5, this.grabStruggles + 1);
+    this.shake = Math.max(this.shake, 2.2);
+    this.hurt = 0.28;
+    this.sfx.bash();
+    z.hurtFlash = 0.1;
+    if (this.grabStruggles >= 5) {
+      const dx = z.x - this.px, dy = z.y - this.py, len = Math.hypot(dx, dy) || 1;
+      const pushed = this.moveBody(z.x, z.y, z.r, dx / len * 18, dy / len * 18);
+      z.x = pushed.x; z.y = pushed.y;
+      z.downT = TACTICAL.ai.pushedDownSeconds;
+      z.grabWindup = 0;
+      z.grabCd = 5;
+      z.stimulus = "player";
+      this.grabbedBy = null;
+      this.grabProtection = TACTICAL.ai.grabReleaseProtection;
+      this.say("Odepchnięcie! Zombie leży — uciekaj albo dokończ atak.");
+    }
+    this.emitHud(true);
+  }
+
+  private updateGrab(dt: number) {
+    const z = this.grabbedBy === null ? null : this.zombieById(this.grabbedBy);
+    if (!z || z.state === "dead") {
+      this.grabbedBy = null;
+      this.grabStruggles = 0;
+      this.grabProtection = Math.max(this.grabProtection, 1);
+      return;
+    }
+    this.moving = false;
+    this.mouseDown = this.touchFire = false;
+    this.grabTick -= dt;
+    if (this.grabTick <= 0) {
+      this.grabTick = TACTICAL.ai.grabDamageInterval;
+      this.damagePlayer(TACTICAL.ai.grabDamage, z.x, z.y);
+      if (this.dead) this.grabbedBy = null;
+    }
+  }
+
+  private scheduleNpc(dt: number) {
+    if (!this.director) return;
+    if (this.director.npcEncounterCount > this.npcSeenCount) {
+      this.npcSeenCount = this.director.npcEncounterCount;
+      this.building.npcDrought = 0;
+      this.building.nextNpcAt = this.time + TACTICAL.npc.repeatDelayMin + Math.random() * (TACTICAL.npc.repeatDelayMax - TACTICAL.npc.repeatDelayMin);
+    }
+    this.npcWait -= dt;
+    if (this.time < this.building.nextNpcAt || this.npcWait > 0 || this.director.choice || this.director.hidden) return;
+    const escortBusy = this.lives.some((f) => f?.director?.escortActive) || this.director.escortActive;
+    const preferred = this.building.npcDrought >= 2 && !escortBusy ? "escort" : undefined;
+    if (this.director.requestNpc(preferred, escortBusy)) {
+      this.building.npcTotal++;
+      this.building.npcDrought = 0;
+      this.npcSeenCount = this.director.npcEncounterCount;
+      this.building.nextNpcAt = this.time + TACTICAL.npc.repeatDelayMin + Math.random() * (TACTICAL.npc.repeatDelayMax - TACTICAL.npc.repeatDelayMin);
+    } else {
+      // Deferred encounter is preserved rather than discarded; it does not reroll every frame.
+      this.npcWait = TACTICAL.npc.retryDelay;
+      this.building.npcDrought = Math.min(9, this.building.npcDrought + 1);
+    }
   }
 
   private countResource(kind: Resource) {
@@ -724,14 +1089,76 @@ export class Game {
       doorAt: (tx, ty) => self.doorAt(tx, ty),
       openDoor: (tx, ty) => {
         const d = self.doorAt(tx, ty);
-        if (!d) return;
+        if (!d || d.sealed || d.route) return;
         d.open = true;
         d.barricaded = false;
         self.data().tiles[self.idx(tx, ty)] = 3;
       },
-      hideSpots: () => self.data().props.filter((p) => (p.kind === "wardrobe" || p.kind === "locker") && (!p.loot || p.opened)),
+      hideSpots: () => self.data().props.filter((p) => (p.kind === "wardrobe" || p.kind === "locker") && (!p.loot || p.opened)
+        && !self.environment?.roomHidden(self.data().roomOf[self.idx(p.x, p.y)])),
       goal: () => self.data().stairsUp ?? self.data().stairsDown,
       rand: () => Math.random(),
+    };
+  }
+
+  private makeEnvironmentWorld(): EnvironmentWorld {
+    const player = () => ({
+      id: heroId, x: this.px, y: this.py, radius: 4.4, hidden: !!this.director?.hidden,
+      busy: this.dead || this.won || this.paused || this.inventoryOpen || !!(this.transition || this.activeDialog || this.director?.choice),
+    });
+    const civilians = () => (this.director?.civilians() ?? []).filter((c) => c.state !== "dead" && c.state !== "gone");
+    return {
+      player,
+      actors: () => {
+        const p = player();
+        return [
+          ...(p.hidden || this.dead ? [] : [p]),
+          ...(this.floor?.zombies ?? []).filter((z) => z.state !== "dead").map((z) => ({ id: z.id, x: z.x, y: z.y, radius: z.r })),
+          ...civilians().map((c) => ({ id: -c.id, x: c.x, y: c.y, radius: 4 })),
+        ];
+      },
+      clear: (from, to) => this.environmentLine(from.x, from.y, to.x, to.y),
+      changed: () => {
+        this.propSolid = this.buildPropSolid();
+        if (!this.director?.hidden) this.unstuck();
+        for (const z of this.floor?.zombies ?? []) {
+          z.path = [];
+          z.pathT = 0;
+          if (z.state !== "dead") {
+            const p = this.shoveOut(z.x, z.y, z.r, 24);
+            z.x = p.x; z.y = p.y;
+          }
+        }
+        for (const c of civilians()) {
+          const p = this.shoveOut(c.x, c.y, 4, 24);
+          c.x = p.x; c.y = p.y; c.pathT = 0;
+        }
+      },
+      hit: (actor, damage, at) => {
+        if (actor.id === heroId) {
+          const hp = this.hp;
+          this.damagePlayer(damage, at.x, at.y, true);
+          if (this.hp < hp) this.environment?.cancelWork();
+        } else if (actor.id < 0) {
+          const c = this.director?.civ(-actor.id);
+          if (c) this.director?.hurtCiv(c, damage, c.x - at.x, c.y - at.y, false);
+        } else {
+          const z = this.zombieById(actor.id);
+          if (z && z.state !== "dead") this.hurtZombie(z, damage, z.x - at.x, z.y - at.y);
+        }
+      },
+      alert: (at, tiles) => {
+        this.alert(at.x, at.y, tiles * TILE, true);
+        if (Math.hypot(at.x - this.px, at.y - this.py) < tiles * TILE) this.noise = Math.max(this.noise, Math.min(1, tiles / 10));
+      },
+      sound: (kind, at) => {
+        const d = Math.hypot(at.x - this.px, at.y - this.py);
+        const range = (kind === "collapse" || kind === "flare" ? 14 : 8) * TILE;
+        if (d < range) this.sfx.environment(kind, Math.max(0.12, 1 - d / range));
+      },
+      dust: (at, color, amount, speed, glow) => this.burst(at.x, at.y, color, amount, speed, glow),
+      shake: (amount) => { this.shake = Math.max(this.shake, amount); },
+      say: (text) => this.say(text),
     };
   }
 
@@ -760,7 +1187,18 @@ export class Game {
       this.emitHud(true);
       return;
     }
-    const seers = this.floor.zombies.filter((z) => z.state !== "dead" && this.seesPlayer(z)).map((z) => z.id);
+    const seers = this.floor.zombies.filter((z) => {
+      if (z.state === "dead") return false;
+      const visible = this.seesPlayer(z);
+      if (!visible) return false;
+      const path = astar(this.data().w, this.data().h, Math.floor(z.x / TILE), Math.floor(z.y / TILE),
+        Math.floor(this.px / TILE), Math.floor(this.py / TILE), (x, y) => this.walkable(x, y, false));
+      if (!path) return false;
+      z.seenWardrobe = { x: Math.floor(this.px / TILE), y: Math.floor(this.py / TILE) };
+      z.lastX = this.px; z.lastY = this.py;
+      z.state = "chase"; z.alertT = 9; z.pathT = 0;
+      return true;
+    }).map((z) => z.id);
     this.hideReturn = { x: this.px, y: this.py };
     if (!this.director.toggleHide(seers)) {
       this.say("Nie ma tu szafy, w której zmieścisz się cały.");
@@ -775,18 +1213,67 @@ export class Game {
   }
 
   chooseOption(index: number) {
+    if (this.verticalChoice) {
+      const mode = this.verticalChoice.mode;
+      const target = this.verticalChoice.targets[index];
+      this.verticalChoice = null;
+      this.interactLock = 0.2;
+      if (mode === "service") {
+        if (index === 0) this.startFreightRide();
+        else if (index === 1) this.requestFloor(this.floorIndex < 9 ? 1 : -1, "service");
+        this.emitHud(true);
+        return;
+      }
+      if (target === null) {
+        const ride = this.building.elevatorRide;
+        if (ride?.phase === "stop" && ride.stopFloor !== undefined) {
+          const stop = ride.stopFloor;
+          this.building.elevatorFloor = stop;
+          this.building.elevatorOpenFloor = stop;
+          this.building.elevatorRide = null;
+          this.enter(stop, "lift");
+          this.addJournal(`Wysiadłeś podczas postoju na ${floorShortName(stop)}.`);
+        }
+      } else if (this.building.elevatorRide?.phase === "stop") {
+        const ride = this.building.elevatorRide;
+        ride.phase = "moving";
+        ride.elapsed = 0;
+        ride.doorOpen = 0;
+        ride.stopFloor = undefined;
+        this.building.elevatorOpenFloor = null;
+        this.sfx.liftMove();
+      } else if (typeof target === "number") {
+        this.startLiftRide(target);
+      }
+      this.emitHud(true);
+      return;
+    }
     this.director?.choose(index);
     this.emitHud(true);
   }
 
-  private enter(index: number, how: "start" | "up" | "down") {
+  private questState(floorIndex = this.floorIndex): FloorQuestState {
+    if (!this.building.quests[floorIndex]) {
+      this.building.quests[floorIndex] = defaultFloorQuestState();
+    }
+    return this.building.quests[floorIndex]!;
+  }
+
+  private enter(index: number, how: "start" | "up" | "down" | "lift" | "service" | "stairsB") {
     if (this.floor) this.floor.hasKey = this.hasKey;
+    this.environment?.cancelWork();
+    this.verticalWork = null;
+    this.verticalChoice = null;
     this.floorIndex = index;
     this.popups = [];
+    let saved: SavedFloor | null = null;
     if (!this.lives[index]) {
-      const data = generateFloor(index, (this.seed + index * 131) >>> 0);
+      const data = generateFloor(index, (this.seed + index * 131) >>> 0, this.seed, this.generatorVersion);
+      const pending = this.restored[index];
+      if (pending?.layout === data.seed) saved = pending;
+      this.restored[index] = null;
       const blood = data.corpses.map((c, idxC) => ({ x: c.x, y: c.y, n: 4, seed: idxC * 19 + 3 }));
-      const corpsesAsDead: Zombie[] = data.corpses.map((c) => ({
+      const corpsesAsDead: Zombie[] = saved ? [] : data.corpses.map((c) => ({
         ...this.makeZombie({ x: c.x, y: c.y, kind: c.kind, room: 0 }),
         hp: 0,
         state: "dead",
@@ -794,29 +1281,57 @@ export class Game {
       }));
       this.lives[index] = {
         data,
-        zombies: [...corpsesAsDead, ...data.zombies.map((z) => this.makeZombie(z))],
+        zombies: saved ? saved.zombies.map((z) => ({ ...this.makeZombie({ ...z, room: z.home }), ...z,
+          downT: z.downT ?? 0, bisected: z.bisected ?? z.kind === "crawler", seenWardrobe: z.seenWardrobe ?? null,
+          deadT: z.state === "dead" ? 5 : 0 }))
+          : [...corpsesAsDead, ...data.zombies.map((z) => {
+            const cell = { x: Math.floor(z.x / TILE), y: Math.floor(z.y / TILE) };
+            const horde = data.vertical?.quest?.horde?.some((p) => p.x === cell.x && p.y === cell.y);
+            return this.makeZombie({ ...z, ...(horde ? { missionTag: "lure" as const } : {}) });
+          }),
+          ...(data.environment?.annexes.flatMap((a) => a.guard ? [this.makeZombie(a.guard)] : []) ?? [])],
         survivors: data.survivors.map((s) => ({
           ...s,
-          state: "hide",
+          state: saved?.survivorsGone.includes(s.id) ? "gone" : "hide",
           vx: 0,
           vy: 0,
           fleeT: 0,
           animT: Math.random() * 3,
         })),
-        explored: new Uint8Array(data.w * data.h),
-        hasKey: false,
+        explored: saved ? Uint8Array.from(saved.explored, (v) => Number(v)) : new Uint8Array(data.w * data.h),
+        hasKey: saved?.hasKey ?? false,
         blood,
         shells: [],
+        environment: saved ? { clock: saved.environment.clock, features: Object.fromEntries(Object.entries(saved.environment.features).map(([id, s]) => [id, { ...s }])) } : createEnvironmentState(),
+        tactical: createTacticalState(saved?.tactical),
       };
     }
     this.floor = this.lives[index]!;
     this.floorIndex = index;
     this.hasKey = this.floor.hasKey;
+    this.syncVerticalDoors(index);
     this.bullets = [];
     this.vis = new Uint8Array(this.floor.data.w * this.floor.data.h);
     this.light = new Float32Array(this.floor.data.w * this.floor.data.h);
+    this.director = this.floor.director ??= new EventDirector(this.makeWorld(), this.art);
+    this.environment = new Environment(this.floor.data, this.floor.environment, this.makeEnvironmentWorld());
+    this.tactical = new TacticalDirector(this.floor.tactical);
+    this.grabbedBy = null;
+    this.grabStruggles = 0;
+    this.grabProtection = 1.5;
+    this.npcSeenCount = this.director.npcEncounterCount;
+    this.npcWait = this.building.npcDrought >= 2 ? TACTICAL.npc.pityDelay : TACTICAL.npc.firstDelay;
+    if (saved) {
+      const opened = new Set(saved.opened);
+      for (const p of this.data().props) p.opened = opened.has(p.id);
+      for (const s of saved.doors) {
+        const d = this.doorAt(s.x, s.y);
+        if (!d || d.sealed || (d.route && this.generatorVersion !== 1)) continue;
+        d.hp = s.hp; d.locked = s.locked; d.open = s.open; d.broken = s.broken; d.barricaded = s.barricaded;
+        this.data().tiles[this.idx(d.x, d.y)] = d.open || d.broken ? Tile.DoorOpen : Tile.Door;
+      }
+    }
     this.propSolid = this.buildPropSolid();
-    this.director = new EventDirector(this.makeWorld(), this.art);
     this.wasHidden = false;
     const d = this.floor.data;
     this.fixtures = d.wallDecals.filter((f) =>
@@ -829,6 +1344,18 @@ export class Game {
     } else if (how === "down" && d.stairsUp) {
       this.px = (d.stairsUp.x + 0.5) * TILE;
       this.py = (d.stairsUp.y + 1.1) * TILE;
+    } else if (how === "lift" && d.vertical?.elevator) {
+      const landing = d.vertical.elevator;
+      this.px = (landing.center.x + 0.5) * TILE;
+      this.py = (landing.center.y + 0.5) * TILE;
+    } else if (how === "service" && d.vertical?.service) {
+      const landing = d.vertical.service;
+      this.px = (landing.outside.x + 0.5) * TILE;
+      this.py = (landing.outside.y + 0.5) * TILE;
+    } else if (how === "stairsB" && d.vertical?.stairsB) {
+      const landing = d.vertical.stairsB;
+      this.px = (landing.outside.x + 0.5) * TILE;
+      this.py = (landing.outside.y + 0.5) * TILE;
     } else {
       this.px = d.playerStart.x;
       this.py = d.playerStart.y;
@@ -837,9 +1364,454 @@ export class Game {
     this.camX = this.px - this.viewW / 2;
     this.camY = this.py - this.viewH / 2;
     this.bannerT = 2.6;
-    this.interactLock = 0.5;
+    this.interactLock = 0.45;
     this.flareCharge = 0;
+    this.updateVerticalQuest();
     this.say(index === 0 ? "Piwnica. Wyjście jest na dachu." : `${d.name} — ${d.sub}`);
+  }
+
+  private syncVerticalDoors(floorIndex = this.floorIndex) {
+    const d = this.floor?.data;
+    if (!d?.vertical) return;
+    const qs = this.questState(floorIndex);
+    const door = (kind: "elevator" | "service" | "stairsB") => d.doors.find((v) => v.route === kind);
+    const lift = door("elevator");
+    if (lift) {
+      lift.open = this.building.elevatorOpenFloor === floorIndex;
+      this.data().tiles[this.idx(lift.x, lift.y)] = lift.open ? Tile.DoorOpen : Tile.Door;
+    }
+    const service = door("service");
+    if (service) {
+      const q = d.vertical.quest;
+      const lockedByFlood = q?.kind === "flooded-route" && qs.stage < 3;
+      const lockedByKeypad = q?.kind === "service-shaft" && !qs.serviceUnlocked && !qs.serviceForced;
+      const freightOpen = this.building.serviceLift?.openFloor === floorIndex;
+      service.open = freightOpen || (!lockedByFlood && !lockedByKeypad);
+      this.data().tiles[this.idx(service.x, service.y)] = service.open ? Tile.DoorOpen : Tile.Door;
+    }
+    const stB = door("stairsB");
+    if (stB) {
+      const q = d.vertical.quest;
+      stB.open = q?.kind !== "apartment-bypass" || qs.bypassOpen;
+      this.data().tiles[this.idx(stB.x, stB.y)] = stB.open ? Tile.DoorOpen : Tile.Door;
+    }
+  }
+
+  private addJournal(entry: string) {
+    const item = entry.trim();
+    if (!item || this.building.journal[this.building.journal.length - 1] === item) return;
+    this.building.journal.push(item);
+    if (this.building.journal.length > 36) this.building.journal.shift();
+    this.say(item);
+  }
+
+  private questInfo(): HudState["quest"] {
+    const ride = this.building.elevatorRide;
+    if (ride) {
+      if (ride.phase === "stranded") return { title: "Awaria windy", step: "Otwórz drzwi dźwignią awaryjną [E]" };
+      if (ride.phase === "stop") return { title: "Nieplanowany postój", step: "Zdecyduj: wysiądź albo jedź dalej" };
+      return { title: "Podróż windą", step: `${floorShortName(ride.from)} → ${floorShortName(ride.to)}` };
+    }
+    const p = this.building.passage;
+    if (p) {
+      if (p.feature === "broken-flight" && !p.bypassOpen) {
+        return { title: "Zawalona klatka", step: "Odsuń przeszkodę na półpiętrze [Przytrzymaj E] lub cofnij się" };
+      }
+      return {
+        title: p.route === "service" || p.route === "ledge" ? "Pion techniczny" : p.route === "stairsB" ? "Klatka B" : "Klatka A",
+        step: `Przejście: ${floorShortName(p.from)} → ${floorShortName(p.to)}`,
+      };
+    }
+    const quest = this.data().vertical?.quest;
+    if (!quest) return null;
+    const qs = this.questState();
+    if (qs.resolved) return null;
+    switch (quest.kind) {
+      case "repair-lift": {
+        const steps = [
+          "Sprawdź panel windy w zachodnim korytarzu (albo idź schodami)",
+          "Odłącz uszkodzony obwód i znajdź bezpiecznik B-4 w warsztacie",
+          "Odnajdź zapasowy bezpiecznik B-4 w warsztacie",
+          "Wróć do windy i zamontuj bezpiecznik B-4",
+          "Przywołaj kabinę [E] i uruchom przejazd",
+        ];
+        return { title: "Przywróć zasilanie windy", step: steps[Math.min(qs.stage, steps.length - 1)] };
+      }
+      case "broken-stairs":
+        return {
+          title: "Zniszczona klatka",
+          step: qs.inspected
+            ? "Odsuń przeszkodę na półpiętrze do zaplecza lub użyj Klatki B / windy"
+            : "Wejdź na Klatkę A lub znajdź inną drogę wyżej",
+        };
+      case "flooded-route": {
+        const steps = [
+          "Zbadaj zalany pion techniczny (wschód) albo wybierz inną klatkę",
+          "Odłącz zwarcie w kałuży i zamknij zawór pary",
+          "Zamknij pozostałe zagrożenie w zalanej strefie",
+          "Przejście odblokowane — użyj latarki w pionie technicznym",
+        ];
+        return { title: "Zalane przejście", step: steps[Math.min(qs.stage, steps.length - 1)] };
+      }
+      case "lure-horde":
+        return {
+          title: "Zombie blokują wyjście",
+          step: qs.lureUsed
+            ? "Omiń odciągniętą grupę i dotrzyj na schody"
+            : "Uruchom konsolę rozgłoszeniową w bocznym pokoju albo oczyść schody",
+        };
+      case "service-shaft":
+        return {
+          title: "Pion techniczny",
+          step: qs.serviceUnlocked || qs.serviceForced
+            ? "Wejdź w pion techniczny na wyższą kondygnację"
+            : qs.codeFound
+              ? `Wpisz kod ${quest.code} przy drzwiach serwisowych`
+              : "Znajdź instrukcję procedury awaryjnej lub sforsuj drzwi łomem",
+        };
+      case "apartment-bypass":
+        return {
+          title: "Przejście do Klatki B",
+          step: qs.bypassOpen
+            ? "Klatka B otwarta — przejdź na wyższe piętro"
+            : qs.inspected
+              ? "Odsuń mebel we wschodnim mieszkaniu [Przytrzymaj E]"
+              : "Sprawdź plan ewakuacyjny lub przejdź przez wschodnie skrzydło",
+        };
+    }
+  }
+
+  private updateVerticalQuest() {
+    if (!this.floor) return;
+    const quest = this.data().vertical?.quest;
+    if (!quest) return;
+    const qs = this.questState();
+    const wireOff = (id?: number) => {
+      if (id === undefined) return true;
+      const f = this.environment?.features.find((ft) => ft.id === id);
+      return !f || !!this.environment?.read(f).off;
+    };
+    const steamOff = (id?: number) => {
+      if (id === undefined) return true;
+      const f = this.environment?.features.find((ft) => ft.id === id);
+      return !f || !!this.environment?.read(f).off;
+    };
+
+    if (quest.kind === "repair-lift") {
+      // Retroactive recognition: disconnecting circuit or picking up fuse before inspecting works seamlessly!
+      const circuitDone = wireOff(quest.wireId);
+      if (circuitDone && qs.stage < 2 && (qs.inspected || qs.fuseTaken)) {
+        qs.stage = 2;
+        if (!qs.fuseTaken) this.addJournal("Obwód rozdzielni odłączony. Odszukaj zapasowy bezpiecznik B-4 w warsztacie.");
+      }
+      if (qs.fuseTaken && circuitDone && qs.stage < 3) {
+        qs.stage = 3;
+        this.addJournal("Masz bezpiecznik B-4 i wyłączony obwód. Wróć do windy, aby przywrócić zasilanie.");
+      }
+      if (this.building.elevatorPowered && qs.stage < 4) {
+        qs.stage = 4;
+      }
+    } else if (quest.kind === "flooded-route") {
+      const done = (wireOff(quest.wireId) ? 1 : 0) + (steamOff(quest.steamId) ? 1 : 0);
+      if (done === 1 && qs.stage < 2) {
+        qs.stage = 2;
+        this.addJournal(
+          wireOff(quest.wireId)
+            ? "Wyładowania ustały, część skrzydła zgasła. Zamknij jeszcze zawór pary."
+            : "Wyciek pary zatrzymany. Odłącz jeszcze uszkodzony przewód w kałuży.",
+        );
+      }
+      if (done === 2 && qs.stage < 3) {
+        qs.stage = 3;
+        qs.resolved = true;
+        this.syncVerticalDoors();
+        this.addJournal("Zalane przejście do pionu technicznego jest bezpieczne, ale ciemne — użyj latarki.");
+      }
+    } else if (quest.kind === "lure-horde" && !qs.lureResolved) {
+      const up = this.data().stairsUp;
+      if (up && !qs.inspected && Math.hypot(this.px - (up.x + 0.5) * TILE, this.py - (up.y + 0.5) * TILE) < 9 * TILE) {
+        qs.inspected = true;
+        qs.stage = 1;
+        this.addJournal("Grupa zombie blokuje wejście na schody. W bocznym pokoju jest konsola rozgłoszeniowa.");
+      }
+      const horde = this.floor.zombies.filter((z) => z.missionTag === "lure" && z.state !== "dead");
+      const crowded = horde.some((z) => up && Math.hypot(z.x - (up.x + 0.5) * TILE, z.y - (up.y + 0.5) * TILE) < 4 * TILE);
+      if (!crowded && (qs.lureUsed || horde.length === 0)) {
+        qs.lureResolved = true;
+        qs.resolved = true;
+        qs.stage = 3;
+        this.addJournal("Droga na klatkę jest wolna. Zombie zmieniły położenie w budynku.");
+      }
+    } else if (quest.kind === "broken-stairs") {
+      if (qs.landingBypassOpen && !qs.resolved) {
+        qs.resolved = true;
+        qs.stage = 3;
+      }
+    } else if (quest.kind === "service-shaft") {
+      if ((qs.serviceUnlocked || qs.serviceForced) && !qs.resolved) {
+        qs.resolved = true;
+        qs.stage = 3;
+        this.syncVerticalDoors();
+      }
+    } else if (quest.kind === "apartment-bypass") {
+      if (qs.bypassOpen && !qs.resolved) {
+        qs.resolved = true;
+        qs.stage = 3;
+        this.syncVerticalDoors();
+      }
+    }
+  }
+
+  private interactVertical(): boolean {
+    if (this.interactLock > 0) return false;
+    const quest = this.data().vertical?.quest;
+    const qs = this.questState();
+    const ride = this.building.elevatorRide;
+
+    // 1. Inside active elevator ride
+    if (ride) {
+      this.interactLock = 0.22;
+      if (ride.phase === "stranded") {
+        // Player can pull the emergency lever inside the cabin — no external tool required!
+        if (ride.cabinX < 4) {
+          // Guide player clearly or let them trigger immediately from anywhere inside the small cabin
+          ride.cabinX = 18;
+        }
+        ride.phase = "escape";
+        ride.elapsed = 0;
+        ride.leverProgress = 1;
+        this.sfx.ladder();
+        this.shake = 3.2;
+        this.say("Pociągasz czerwoną dźwignię awaryjną. Drzwi uchylają się ze zgrzytem...");
+        return true;
+      }
+      if (ride.phase === "stop" && ride.stopFloor !== undefined) {
+        this.verticalChoice = {
+          targets: [null, ride.to],
+          labels: [`Wysiądź (${floorShortName(ride.stopFloor)})`, `Jedź dalej (${floorShortName(ride.to)})`],
+          label: "NIEPLANOWANY POSTÓJ",
+          text: `Drzwi uchyliły się na ${floorShortName(ride.stopFloor)}. Możesz zbadać to piętro albo kontynuować podróż.`,
+        };
+        return true;
+      }
+      if (ride.phase === "moving" || ride.phase === "accel") {
+        this.say("Kabina jest w ruchu.");
+        return true;
+      }
+      return true;
+    }
+
+    // 2. Inside active playable stairwell / technical shaft
+    const p = this.building.passage;
+    if (p) {
+      this.interactLock = 0.22;
+      if ((p.feature === "stash" || p.feature === "traces") && !p.stashLooted && Math.hypot(p.x - 18, p.y - 16) < 26) {
+        p.stashLooted = true;
+        const fqs = this.questState(p.from);
+        fqs.landingStashOpened = true;
+        this.pack.stock.rounds += 6;
+        this.battery = Math.min(100, this.battery + 20);
+        this.sfx.pickup();
+        this.say("Schowek konserwatora: +6 naboi, +20% baterii.");
+        this.addJournal("Na półpiętrze znalazłeś schowek konserwatora z zapasami.");
+        return true;
+      }
+      if (p.feature === "broken-flight" && p.bypassOpen && Math.hypot(p.x - 126, p.y - 18) < 26) {
+        this.finishPassage(p.to, "stairsB");
+        return true;
+      }
+      if (p.route === "service" || p.route === "ledge") {
+        if (p.y < 32) { this.finishPassage(p.to, "service"); return true; }
+        if (p.y > 84) { this.finishPassage(p.from, "service"); return true; }
+      } else {
+        if (p.x > 84 && p.y > 84 && p.feature !== "broken-flight") {
+          this.finishPassage(p.to, p.route === "stairsB" ? "stairsB" : p.to > p.from ? "up" : "down");
+          return true;
+        }
+        if (p.x < 60 && p.y > 84) {
+          this.finishPassage(p.from, p.route === "stairsB" ? "stairsB" : p.to > p.from ? "down" : "up");
+          return true;
+        }
+      }
+      return true;
+    }
+
+    // 3. On a regular floor: scenario interactables & vertical portals
+    const vertical = this.data().vertical;
+    if (!vertical) return false;
+
+    // Scenario A: spare fuse pickup in workshop
+    if (quest?.kind === "repair-lift" && quest.fuseCell && !qs.fuseTaken && this.closeEnough(quest.fuseCell, 25)) {
+      qs.fuseTaken = true;
+      this.interactLock = 0.2;
+      this.sfx.key();
+      const c = this.tileCenter(quest.fuseCell);
+      this.burst(c.x, c.y, COL.fluor, 9, 44, true);
+      this.addPopup(c.x, c.y - 8, "+ BEZPIECZNIK B-4", COL.fluor);
+      this.addJournal("Zabrano zapasowy bezpiecznik B-4 z warsztatu.");
+      this.updateVerticalQuest();
+      return true;
+    }
+
+    // Scenario D: acoustic lure console
+    if (quest?.kind === "lure-horde" && quest.beacon && !qs.lureUsed && this.closeEnough(quest.beacon, 25)) {
+      qs.lureUsed = true;
+      qs.inspected = true;
+      qs.stage = 2;
+      this.interactLock = 0.25;
+      const c = this.tileCenter(quest.beacon);
+      this.sfx.alarm();
+      this.burst(c.x, c.y, "#eac584", 12, 55, true);
+      this.alert(c.x, c.y, 38 * TILE, true);
+      this.noise = 1;
+      this.shake = Math.max(this.shake, 1.4);
+      this.addPopup(c.x, c.y - 8, "SYGNAŁ URUCHOMIONY!", "#eac584");
+      this.addJournal("Sygnał rozgłoszeniowy włączył się w bocznym pokoju — zombie przy schodach ruszają w stronę hałasu.");
+      return true;
+    }
+
+    // Scenario E: emergency procedure plaque
+    if (quest?.kind === "service-shaft" && quest.clueCell && !qs.codeFound && this.closeEnough(quest.clueCell, 25)) {
+      qs.codeFound = true;
+      qs.inspected = true;
+      qs.stage = 2;
+      this.interactLock = 0.2;
+      this.sfx.pickup();
+      const c = this.tileCenter(quest.clueCell);
+      this.addPopup(c.x, c.y - 8, `KOD: ${quest.code}`, COL.fluor);
+      this.addJournal(`Instrukcja procedury awaryjnej pionu technicznego: kod dostępu ${quest.code}.`);
+      return true;
+    }
+
+    // Scenario F: evacuation plan plaque
+    if (quest?.kind === "apartment-bypass" && quest.clueCell && !qs.inspected && this.closeEnough(quest.clueCell, 25)) {
+      qs.inspected = true;
+      qs.stage = 1;
+      this.interactLock = 0.2;
+      this.sfx.pickup();
+      this.addJournal("Plan ewakuacyjny: Klatka B jest po wschodniej stronie piętra — dojście przez zastawione mieszkanie.");
+      return true;
+    }
+
+    // Elevator cabin interior panel
+    const lift = vertical.elevator;
+    if (lift && this.inLiftCabin(lift) && this.closeEnough(lift.panel, 25)) {
+      this.interactLock = 0.2;
+      if (!this.building.elevatorPowered || this.building.elevatorBroken || this.building.elevatorOpenFloor !== this.floorIndex) {
+        this.say("Panel kabiny nie odpowiada.");
+        return true;
+      }
+      this.offerLiftFloors();
+      return true;
+    }
+
+    // Elevator exterior call button
+    if (lift && this.closeEnough(lift.call, 25)) {
+      this.interactLock = 0.22;
+      if (quest?.kind === "repair-lift") {
+        const wire = this.environment?.features.find((f) => f.id === quest.wireId);
+        const wireOff = !wire || !!this.environment?.read(wire).off;
+        if (!qs.inspected && !this.building.elevatorPowered) {
+          qs.inspected = true;
+          qs.stage = Math.max(qs.stage, 1);
+          this.sfx.dry();
+          this.addJournal("Panel windy martwy. Tabliczka przy drzwiach: 'Zasilanie awaryjne: rozdzielnia w warsztacie, bezpiecznik B-4'.");
+          this.updateVerticalQuest();
+          return true;
+        }
+        if (qs.fuseTaken && !this.building.elevatorPowered) {
+          if (!wireOff) {
+            this.say("Zwarcie w obwodzie warsztatu! Najpierw odłącz bezpiecznik zwarcia.");
+            return true;
+          }
+          this.building.elevatorPowered = true;
+          this.building.elevatorEmergencyOnly = true;
+          this.building.elevatorBroken = false;
+          qs.stage = 4;
+          qs.resolved = true;
+          this.sfx.powerUp();
+          this.sfx.liftCall();
+          this.addJournal("Zamontowano bezpiecznik B-4. Kontrolki windy zapaliły się — tryb awaryjny gotowy do przywołania.");
+          return true;
+        }
+      }
+      if (this.building.elevatorBroken) {
+        // Optional relay reset on floors >= 2 so players can reuse the elevator later in the run
+        if (this.floorIndex >= 2) {
+          this.building.elevatorBroken = false;
+          this.building.elevatorEmergencyOnly = false;
+          this.building.elevatorPowered = true;
+          this.sfx.powerUp();
+          this.addJournal("Zresetowano przekaźnik windy. Winda wróciła do standardowej pracy.");
+          return true;
+        }
+        this.say("Winda jest unieruchomiona po awarii. Skorzystaj ze schodów lub zresetuj przekaźnik wyżej.");
+        return true;
+      }
+      if (!this.building.elevatorPowered) {
+        this.say("Winda nie ma zasilania. Sprawdź rozdzielnię na parterze lub użyj schodów.");
+        return true;
+      }
+      this.startLiftCall();
+      return true;
+    }
+
+    // Technical service shaft doorway / keypad
+    const service = vertical.service;
+    if (service && (this.closeEnough(service.panel, 24) || this.closeEnough(service.door, 24))) {
+      this.interactLock = 0.22;
+      if (quest?.kind === "flooded-route" && qs.stage < 3) {
+        if (!qs.inspected) {
+          qs.inspected = true;
+          qs.stage = Math.max(qs.stage, 1);
+          this.addJournal("Wejście do pionu technicznego zalane: odłącz przewód pod napięciem i zakręć zawór pary.");
+          this.updateVerticalQuest();
+          return true;
+        }
+        this.say("Przejście nadal niebezpieczne — odłącz zwarcie i zamknij zawór pary.");
+        return true;
+      }
+      if (quest?.kind === "service-shaft" && !qs.serviceUnlocked && !qs.serviceForced) {
+        if (qs.codeFound) {
+          qs.serviceUnlocked = true;
+          qs.stage = 3;
+          qs.resolved = true;
+          this.syncVerticalDoors();
+          this.sfx.key();
+          this.addJournal(`Wpisano kod ${quest.code}. Zamek pionu technicznego otworzył się cicho.`);
+          return true;
+        }
+        if (!qs.inspected) {
+          qs.inspected = true;
+          qs.stage = 1;
+          this.addJournal("Drzwi pionu technicznego zablokowane zamkiem kodowym. Znajdź instrukcję procedury albo przytrzymaj E, by sforsować łomem.");
+          this.sfx.dry();
+          return true;
+        }
+        this.say("Potrzebny kod z instrukcji — albo przytrzymaj E, aby sforsować zamek (głośno).");
+        return true;
+      }
+      this.offerServiceRoute();
+      return true;
+    }
+
+    // Second stairwell (Klatka B)
+    const stB = vertical.stairsB;
+    if (stB && (this.closeEnough(stB.stairs, 24) || this.closeEnough(stB.outside, 24))) {
+      this.interactLock = 0.22;
+      if (quest?.kind === "apartment-bypass" && !qs.bypassOpen) {
+        qs.inspected = true;
+        qs.stage = Math.max(qs.stage, 1);
+        this.say("Klatka B jest zablokowana od strony mieszkania — odsuń przeszkodę we wschodnim skrzydle.");
+        this.sfx.dry();
+        return true;
+      }
+      const dir = this.floorIndex < 9 ? 1 : -1;
+      this.requestFloor(dir, "stairsB");
+      return true;
+    }
+
+    return false;
   }
 
   private unstuck() {
@@ -912,6 +1884,22 @@ export class Game {
     this.fade = 0;
     this.time += dt;
     this.interactLock = Math.max(0, this.interactLock - dt);
+    if (this.building.elevatorRide) {
+      if (!this.verticalChoice) this.updateLiftRide(dt);
+      this.updateParticles(dt);
+      this.emitHud(false);
+      return;
+    }
+    if (this.building.passage) {
+      this.updatePassage(dt);
+      this.updateParticles(dt);
+      this.emitHud(false);
+      return;
+    }
+    if (this.verticalChoice) {
+      this.emitHud(false);
+      return;
+    }
     this.meleeCd = Math.max(0, this.meleeCd - dt);
     this.meleeT = Math.max(0, this.meleeT - dt);
     if (!this.meleeHit && this.meleeT > 0 && 1 - this.meleeT / this.meleeDur >= 0.4) {
@@ -936,7 +1924,24 @@ export class Game {
       this.emitHud(false);
       return;
     }
+    if (this.grabbedBy !== null) {
+      this.updateGrab(dt);
+      this.updateTactical(dt);
+      this.computeVisibility();
+      this.director?.update(dt);
+      this.updateZombies(dt);
+      this.updateBullets(dt);
+      this.updateParticles(dt);
+      this.emitHud(false);
+      return;
+    }
     this.updatePlayer(dt);
+    this.updateVerticalHold(dt);
+    this.tickVertical(dt);
+    if (this.director?.camp) this.environment?.ignite(this.director.camp);
+    this.environment?.update(dt);
+    this.updateTactical(dt);
+    this.updateVerticalQuest();
     this.computeVisibility();
     this.director?.update(dt);
     if (this.wasHidden && this.director && !this.director.hidden) {
@@ -949,6 +1954,7 @@ export class Game {
     this.updateSurvivors(dt);
     this.updatePopups(dt);
     this.updateZombies(dt);
+    this.updateVerticalQuest();
     this.updateBullets(dt);
     this.updateShells(dt);
     this.updateParticles(dt);
@@ -975,7 +1981,7 @@ export class Game {
   private updateLightsAudio() {
     if (!this.floor) return;
     for (const lf of this.data().lights) {
-      if (!lf.flicker || lf.kind !== "fluor") continue;
+      if (!lf.flicker || lf.kind !== "fluor" || this.environment?.roomDark(lf.roomId) || this.environment?.roomHidden(lf.roomId)) continue;
       if (Math.hypot(lf.x - this.px, lf.y - this.py) < 5.5 * TILE) {
         if (this.fixtureIntensity(lf) < 0.35) this.sfx.buzz(this.time);
       }
@@ -1031,7 +2037,7 @@ export class Game {
     for (const lf of d.lights) {
       if (lf.kind !== "fluor" || !lf.flicker) continue;
       if (Math.hypot(lf.x - this.px, lf.y - this.py) > 9 * TILE) continue;
-      if (this.fixtureIntensity(lf) < 0.6 && Math.random() < 0.6) {
+      if (!this.environment?.roomDark(lf.roomId) && !this.environment?.roomHidden(lf.roomId) && this.fixtureIntensity(lf) < 0.6 && Math.random() < 0.6) {
         for (let i = 0; i < 3; i++) {
           this.particles.push({
             x: lf.x + (Math.random() - 0.5) * 8,
@@ -1125,6 +2131,7 @@ export class Game {
 
   private updatePlayer(dt: number) {
     if (this.director?.hidden) {
+      this.environment?.cancelWork();
       this.moving = false;
       this.stamina = Math.min(100, this.stamina + 24 * dt);
       this.mouseDown = false;
@@ -1149,6 +2156,14 @@ export class Game {
       mx /= len;
       my /= len;
     }
+    const work = this.environment?.updateWork(dt,
+      len === 0 && this.hurt < 0.65 && this.interactLock <= 0 && (this.keys.has("KeyE") || this.touchHold),
+      this.stamina, this.pack.owned.includes("crowbar") || this.pack.owned.includes("hatchet"));
+    if (work) {
+      this.aim = Math.atan2(work.face.y - this.py, work.face.x - this.px);
+      this.dir = dirFrom(this.aim);
+      this.tactical?.playerContinuous(work.effort * 1.6, dt, this.px, this.py, 8 * TILE);
+    }
     const sprinting =
       (this.keys.has("ShiftLeft") || this.keys.has("ShiftRight")) &&
       len > 0 &&
@@ -1164,20 +2179,34 @@ export class Game {
         this.alert(this.px, this.py, 4.2 * TILE);
         this.noise = Math.max(this.noise, 0.55);
       }
+    } else if (work) {
+      this.stamina = Math.max(0, this.stamina - work.effort * dt);
     } else {
       this.stamina = Math.min(100, this.stamina + 18 * dt);
       if (this.stamina > 28) this.staminaLock = false;
     }
     this.sprinting = sprinting;
-    let speed = sprinting ? 118 : 80;
+    const careful = this.keys.has("ControlLeft") || this.keys.has("ControlRight");
+    let speed = sprinting ? 118 : careful ? 48 : 80;
     if (this.flareCharge > 0) speed *= 0.4;
+    if (this.environment?.inSteam(this.px, this.py)) speed *= 0.43;
+    else if (this.environment?.slow(heroId)) speed *= 0.57;
     const t = this.tileAt(Math.floor(this.px / TILE), Math.floor(this.py / TILE));
     if (t === 7 || t === 8) speed *= 0.72;
     this.moving = len > 0;
     if (this.moving) {
+      const oldX = this.px, oldY = this.py;
       const n = this.moveBody(this.px, this.py, 4.4, mx * speed * dt, my * speed * dt);
       this.px = n.x;
       this.py = n.y;
+      const travelled = Math.hypot(n.x - oldX, n.y - oldY);
+      if (this.tactical && travelled > 0.005) {
+        const rate = sprinting ? TACTICAL.noise.runPerSecond : careful ? TACTICAL.noise.carefulPerSecond : TACTICAL.noise.walkPerSecond;
+        this.tactical.playerContinuous(rate, dt, this.px, this.py, sprinting ? 9 * TILE : careful ? 2.2 * TILE : 4.5 * TILE);
+        this.noise = this.tactical.state.playerNoise / 100;
+      }
+      const crossedTile = Math.floor(oldX / TILE) !== Math.floor(n.x / TILE) || Math.floor(oldY / TILE) !== Math.floor(n.y / TILE);
+      if (crossedTile || ((oldX !== n.x || oldY !== n.y) && this.stepT <= 0)) this.environment?.footstep(n, sprinting);
       this.animT += dt * (sprinting ? 13 : 9);
       this.stepT -= dt;
       if (this.stepT <= 0) {
@@ -1210,7 +2239,7 @@ export class Game {
         this.say("Latarka zgasła.");
       }
     }
-    if ((this.mouseDown || this.touchFire) && this.flareCharge <= 0) this.shoot();
+    if (!work && (this.mouseDown || this.touchFire) && this.flareCharge <= 0) this.shoot();
   }
 
   private toggleFlash() {
@@ -1232,8 +2261,9 @@ export class Game {
     const roomId = this.data().roomOf[this.idx(tx, ty)];
     const room = roomId >= 0 ? this.data().rooms[roomId] : null;
     const blackout = (this.director?.blackoutT ?? 0) > 0;
-    const isDark = this.data().theme !== "roof" && (blackout || (!!room && !room.lit));
-    const context = isDark ? `${this.floorIndex}:${roomId}:${blackout ? "blackout" : "room"}` : null;
+    const circuit = this.environment?.roomDark(roomId);
+    const isDark = this.data().theme !== "roof" && (blackout || circuit || (!!room && !room.lit));
+    const context = isDark ? `${this.floorIndex}:${roomId}:${blackout ? "blackout" : circuit ? "circuit" : "room"}` : null;
     if (context === this.darknessContext) return;
     this.darknessContext = context;
     if (!context || this.flashOn || this.battery <= 0) return;
@@ -1291,7 +2321,7 @@ export class Game {
   }
 
   private shoot() {
-    if (this.director?.hidden || this.director?.choice) return;
+    if (this.director?.hidden || this.director?.choice || this.environment?.working) return;
     if (this.paused || this.inventoryOpen || this.activeDialog || this.won || this.shootCd > 0 || this.reloadT > 0 || this.meleeT > 0 || this.dead) return;
     const spec = WEAPONS[this.weapon];
     if (!spec.ammo) { this.melee(); return; }
@@ -1344,16 +2374,20 @@ export class Game {
     if (bow) {
       this.sfx.bow();
       this.recoil = 0.22;
-      this.noise = 0.18;
-      this.alert(this.px, this.py, spec.noise * TILE);
+      this.tactical?.playerPulse(TACTICAL.noise.gun.crossbow, this.px, this.py, spec.noise * TILE, 1.2, 2);
+      this.noise = (this.tactical?.state.playerNoise ?? 16) / 100;
+      this.alert(this.px, this.py, spec.noise * TILE, true);
       return;
     }
     this.flashT = shotgun ? 0.075 : 0.055;
+    this.environment?.ignite({ x: this.px, y: this.py });
+    if (this.environmentLine(this.px, this.py, mx, my)) this.environment?.ignite({ x: mx, y: my });
     this.muzzleLight = shotgun ? 1.35 : 0.95;
     this.recoil = shotgun ? 1.0 : 0.65;
     this.shake = Math.max(this.shake, shotgun ? 4.2 : 1.8);
-    this.noise = 1;
-    this.alert(this.px, this.py, spec.noise * TILE);
+    this.tactical?.playerPulse(TACTICAL.noise.gun[this.weapon], this.px, this.py, spec.noise * TILE, 2.8, TACTICAL.noise.gun[this.weapon] * 0.18);
+    this.noise = (this.tactical?.state.playerNoise ?? 100) / 100;
+    this.alert(this.px, this.py, spec.noise * TILE, true);
     if (shotgun) this.sfx.shotgun();
     else if (this.weapon === "revolver") this.sfx.revolver();
     else this.sfx.gun();
@@ -1375,19 +2409,22 @@ export class Game {
   }
 
   private melee() {
-    if (this.director?.hidden || this.director?.choice) return;
+    if (this.director?.hidden || this.director?.choice || this.environment?.working) return;
     if (WEAPONS[this.weapon].ammo || this.meleeCd > 0 || this.inventoryOpen || this.activeDialog || this.dead || this.paused || !this.floor) return;
     this.meleeCd = WEAPONS[this.weapon].cooldown;
-    this.meleeDur = this.weapon === "hatchet" ? 0.5 : 0.4;
+    this.meleeDur = this.weapon === "hatchet" ? 0.5 : this.weapon === "machete" ? 0.32 : 0.4;
     this.meleeT = this.meleeDur;
     this.meleeHit = false;
-    this.sfx.draw();
+    if (this.weapon === "machete") this.sfx.machete(); else this.sfx.draw();
+    this.tactical?.playerPulse(TACTICAL.noise.gun[this.weapon], this.px, this.py, 4.5 * TILE, 1.2, 2.5);
   }
 
   private meleeStrike() {
     if (!this.floor) return;
-    this.sfx.melee();
-    let hit = false;
+    if (this.weapon === "machete") this.sfx.machete(); else this.sfx.melee();
+    let hit = this.environment?.strike(this.aim, WEAPONS[this.weapon].reach) ?? false;
+    const barrelPoint = { x: this.px + Math.cos(this.aim) * 17, y: this.py + Math.sin(this.aim) * 17 };
+    if (this.hitBarrelAt(barrelPoint.x, barrelPoint.y, true)) hit = true;
     for (const z of this.floor.zombies) {
       if (z.state === "dead") continue;
       const dx = z.x - this.px;
@@ -1396,7 +2433,7 @@ export class Game {
       if (dist > WEAPONS[this.weapon].reach + z.r) continue;
       if (Math.abs(angDiff(Math.atan2(dy, dx), this.aim)) > 1.1) continue;
       const sneak = z.state === "idle";
-      this.hurtZombie(z, WEAPONS[this.weapon].damage * (sneak ? 2 : 1), dx, dy);
+      this.hurtZombie(z, WEAPONS[this.weapon].damage * (sneak ? 2 : 1), dx, dy, this.weapon);
       hit = true;
       if (sneak) {
         this.noise = Math.max(this.noise, 0.2);
@@ -1417,7 +2454,7 @@ export class Game {
     const hx = this.px + Math.cos(this.aim) * 16;
     const hy = this.py + Math.sin(this.aim) * 16;
     const doorHit = this.data().doors.find(
-      (d) => !d.open && !d.broken && Math.hypot((d.x + 0.5) * TILE - hx, (d.y + 0.5) * TILE - hy) < 16,
+      (d) => !d.sealed && !d.route && !d.open && !d.broken && Math.hypot((d.x + 0.5) * TILE - hx, (d.y + 0.5) * TILE - hy) < 16,
     );
     if (doorHit && !doorHit.locked) {
       doorHit.hp -= 3;
@@ -1444,8 +2481,27 @@ export class Game {
     }
   }
 
-  private hurtZombie(z: Zombie, dmg: number, dx: number, dy: number) {
+  private hurtZombie(z: Zombie, dmg: number, dx: number, dy: number, meleeWeapon?: WeaponId) {
+    z.stimulus = "player";
+    z.stimulusUntil = (this.tactical?.clock ?? 0) + 4;
     z.hp -= dmg;
+    if (z.hp > 0 && meleeWeapon && (meleeWeapon === "machete" || meleeWeapon === "hatchet")
+      && (z.kind === "shambler" || z.kind === "runner") && !z.bisected) {
+      const chance = meleeWeapon === "machete" ? 0.46 : 0.24;
+      if (Math.random() < chance) {
+        // Same identity and remaining HP: no duplicate enemy, reward or kill until final death.
+        z.kind = "crawler";
+        z.bisected = true;
+        z.r = ZT.crawler.r;
+        z.speed = ZT.crawler.speed;
+        z.dmg = ZT.crawler.dmg;
+        z.attackEvery = ZT.crawler.every;
+        z.downT = 0.55;
+        z.grabWindup = 0;
+        this.burst(z.x, z.y + 3, COL.bloodBright, 14, 65);
+        this.addPopup(z.x, z.y - 8, "ROZPOŁOWIONY", COL.bloodBright);
+      }
+    }
     z.hurtFlash = 0.11;
     z.alertMark = 0.7;
     z.state = "chase";
@@ -1460,6 +2516,11 @@ export class Game {
     this.bleed(z.x, z.y, dx, dy);
     this.sfx.hit(false);
     if (z.hp <= 0) {
+      if (this.grabbedBy === z.id) {
+        this.grabbedBy = null;
+        this.grabStruggles = 0;
+        this.grabProtection = 1.2;
+      }
       z.state = "dead";
       z.hp = 0;
       z.deadT = 0;
@@ -1491,22 +2552,24 @@ export class Game {
     }
   }
 
-  private damagePlayer(dmg: number, fromX: number, fromY: number) {
+  private damagePlayer(dmg: number, fromX: number, fromY: number, environment = false) {
     if (this.invuln > 0 || this.dead) return;
     this.hp = Math.max(0, this.hp - dmg);
     this.invuln = 0.55;
     this.hurt = 1;
-    this.shake = 5;
+    this.environmentHit = environment;
+    this.shake = environment ? Math.max(this.shake, 2.2) : 5;
     if (this.flareCharge > 0.15) this.say("Przerwane!");
     this.flareCharge = 0;
     const dx = this.px - fromX;
     const dy = this.py - fromY;
     const len = Math.hypot(dx, dy) || 1;
-    const n = this.moveBody(this.px, this.py, 4.4, (dx / len) * 10, (dy / len) * 10);
+    const push = environment ? 4 : 10;
+    const n = this.moveBody(this.px, this.py, 4.4, (dx / len) * push, (dy / len) * push);
     this.px = n.x;
     this.py = n.y;
     this.sfx.hurt();
-    this.bleed(this.px, this.py, dx, dy);
+    if (!environment) this.bleed(this.px, this.py, dx, dy);
     if (this.hp <= 0) {
       this.hp = 0;
       this.dead = true;
@@ -1515,15 +2578,16 @@ export class Game {
     }
   }
 
-  private alert(x: number, y: number, radius: number) {
+  private alert(x: number, y: number, radius: number, investigate = false) {
     if (!this.floor) return;
+    this.tactical?.emit(x, y, Math.min(90, radius / TILE * 4), radius, 1.8, Math.min(18, radius / TILE * 0.65), investigate ? "world" : "player");
     for (const z of this.floor.zombies) {
       if (z.state === "dead") continue;
       if (Math.hypot(z.x - x, z.y - y) <= radius) {
         if (z.state !== "chase") z.alertMark = 0.85;
         z.state = "chase";
-        z.lastX = this.px;
-        z.lastY = this.py;
+        z.lastX = investigate ? x : this.px;
+        z.lastY = investigate ? y : this.py;
         z.alertT = 6.5;
         z.pathT = 0;
       }
@@ -1533,11 +2597,12 @@ export class Game {
   private walkable(x: number, y: number, idle: boolean) {
     if (!this.inb(x, y)) return false;
     const t = this.tileAt(x, y);
-    if (t === 0 || t === 6 || t === 9) return false;
-    if (this.propSolid[this.idx(x, y)]) return false;
+    if (t === Tile.Wall || t === Tile.Window || t === Tile.Sky || t === Tile.Hole) return false;
+    if (this.propSolid[this.idx(x, y)] || this.environment?.blocksTile(x, y)) return false;
+    if (this.environment?.inSteam((x + 0.5) * TILE, (y + 0.5) * TILE)) return false;
     if (t === 2) {
       const d = this.doorAt(x, y);
-      if (!d || d.locked || idle) return false;
+      if (!d || d.sealed || d.route || d.locked || idle) return false;
       return true;
     }
     return true;
@@ -1567,6 +2632,19 @@ export class Game {
     return true;
   }
 
+  private environmentLine(x0: number, y0: number, x1: number, y1: number) {
+    const steps = Math.ceil(Math.hypot(x1 - x0, y1 - y0) / 2);
+    let lastX = Math.floor(x0 / TILE), lastY = Math.floor(y0 / TILE);
+    if (this.opaque(lastX, lastY)) return false;
+    for (let i = 1; i <= steps; i++) {
+      const x = Math.floor((x0 + (x1 - x0) * i / steps) / TILE);
+      const y = Math.floor((y0 + (y1 - y0) * i / steps) / TILE);
+      if (this.opaque(x, y) || (x !== lastX && y !== lastY && (this.opaque(x, lastY) || this.opaque(lastX, y)))) return false;
+      lastX = x; lastY = y;
+    }
+    return true;
+  }
+
   private castRay(ox: number, oy: number, angle: number, maxDist: number) {
     const dx = Math.cos(angle);
     const dy = Math.sin(angle);
@@ -1585,6 +2663,7 @@ export class Game {
   }
 
   private fixtureIntensity(lf: { flicker: boolean; roomId: number; x: number; y: number }) {
+    if (this.environment?.roomDark(lf.roomId)) return 0;
     if (!lf.flicker) return 1;
     const seed = lf.roomId * 9.2 + lf.x * 0.03;
     const n = Math.sin(this.time * 16.5 + seed) * Math.sin(this.time * 5.7 + seed * 0.5);
@@ -1603,7 +2682,7 @@ export class Game {
     const room = roomId >= 0 ? this.data().rooms[roomId] : null;
     const theme = this.data().theme;
     const blackout = (this.director?.blackoutT ?? 0) > 0;
-    const base = theme === "roof" ? 13 : blackout ? 3.4 : room?.lit ? 9.0 : theme === "lobby" ? 6.2 : 3.4;
+    const base = theme === "roof" ? 13 : blackout || this.environment?.roomDark(roomId) ? 3.4 : room?.lit ? 9.0 : theme === "lobby" ? 6.2 : 3.4;
     const flashR = this.flashOn && this.battery > 0 ? 11.4 : 0;
     const maxR = Math.ceil(Math.max(base, flashR));
     for (let ty = pty - maxR; ty <= pty + maxR; ty++) {
@@ -1618,6 +2697,8 @@ export class Game {
         if (dist > reach) continue;
         if (!this.rayClear(ptx, pty, tx, ty)) continue;
         const i = this.idx(tx, ty);
+        const rid = this.data().roomOf[i];
+        if (this.environment?.roomHidden(rid)) continue;
         this.vis[i] = 1;
         this.floor.explored[i] = 1;
         // odsłoń także narożniki i ściany po skosie, żeby mury nie miały czarnych wyrw
@@ -1631,11 +2712,10 @@ export class Game {
             if (nt === 0 || nt === 6) this.floor.explored[this.idx(nx, ny)] = 1;
           }
         }
-        const rid = this.data().roomOf[i];
         const rr = rid >= 0 ? this.data().rooms[rid] : null;
         let L = 0.25;
         if (theme === "roof") L = 0.92;
-        else if (blackout) L = 0.2;
+        else if (blackout || this.environment?.roomDark(rid)) L = 0.2;
         else if (rr?.lit) L = 0.82;
         else if (theme === "lobby") L = 0.48;
         else if (theme === "flat") L = 0.3;
@@ -1648,7 +2728,11 @@ export class Game {
 
   private seesPlayer(z: Zombie) {
     const d = Math.hypot(z.x - this.px, z.y - this.py);
-    if (this.director?.hidden) return this.director.isWitness(z.id) && d < 9 * TILE;
+    if (this.director?.hidden) {
+      const spot = this.director.hidePosition();
+      const remembered = z.seenWardrobe && spot && z.seenWardrobe.x === Math.floor(spot.x / TILE) && z.seenWardrobe.y === Math.floor(spot.y / TILE);
+      return (this.director.isWitness(z.id) || !!remembered) && d < 9 * TILE;
+    }
     if (d > 7.6 * TILE) return false;
     if (
       !this.rayClear(
@@ -1674,17 +2758,60 @@ export class Game {
     return d < 2.2 * TILE;
   }
 
+  private updateZombieStimulus(z: Zombie, playerSeen: boolean, playerDist: number) {
+    if (!this.tactical) return playerSeen;
+    const close = playerSeen && playerDist < TACTICAL.devices.closePlayerOverride;
+    if (close) {
+      z.stimulus = "player";
+      z.stimulusUntil = this.tactical.clock + TACTICAL.devices.interestSeconds;
+      z.lastX = this.px; z.lastY = this.py;
+      return true;
+    }
+    const heard = this.tactical.strongestFor(z.x, z.y, (source) => this.rayClear(
+      Math.floor(z.x / TILE), Math.floor(z.y / TILE), Math.floor(source.x / TILE), Math.floor(source.y / TILE)) ? 1 : 0.38);
+    const committed = this.tactical.clock < z.stimulusUntil;
+    if (heard && (!playerSeen || playerDist > 4 * TILE || heard.source === "device") && (!committed || heard.source === "device")) {
+      if (z.stimulus !== heard.source || Math.hypot(z.lastX - heard.x, z.lastY - heard.y) > 12) {
+        z.alertMark = 0.7; // visible pause/turn toward the new source
+        z.pathT = 0;
+      }
+      z.stimulus = heard.source === "world" ? "noise" : heard.source;
+      z.stimulusUntil = this.tactical.clock + TACTICAL.devices.interestSeconds;
+      z.lastX = heard.x; z.lastY = heard.y;
+      z.state = "chase";
+      z.alertT = Math.max(z.alertT, 6);
+      return false;
+    }
+    if (playerSeen && z.stimulus !== "device" && z.stimulus !== "noise") {
+      z.stimulus = "player";
+      return true;
+    }
+    if (playerSeen && z.stimulus === null) {
+      z.stimulus = "player";
+      return true;
+    }
+    if (this.tactical.clock >= z.stimulusUntil && !playerSeen) z.stimulus = null;
+    return false;
+  }
+
   private updateZombies(dt: number) {
     if (!this.floor) return;
+    this.grabProtection = Math.max(0, this.grabProtection - dt);
     const list = this.floor.zombies;
     for (const z of list) {
       z.animT += dt;
+      z.grabCd = Math.max(0, z.grabCd - dt);
       z.attackCd = Math.max(0, z.attackCd - dt);
       z.hurtFlash = Math.max(0, z.hurtFlash - dt);
       z.alertMark = Math.max(0, z.alertMark - dt);
       z.bashT = Math.max(0, z.bashT - dt);
       if (z.state === "dead") {
         z.deadT += dt;
+        continue;
+      }
+      if (this.grabbedBy === z.id) continue;
+      if (z.downT > 0) {
+        z.downT = Math.max(0, z.downT - dt);
         continue;
       }
       if (z.kind === "boss") {
@@ -1719,11 +2846,43 @@ export class Game {
       const civTarget = this.director?.nearestCivTo(z.x, z.y, 9 * TILE) ?? null;
       const civDist = civTarget ? Math.hypot(civTarget.x - z.x, civTarget.y - z.y) : Infinity;
       const playerDist = Math.hypot(z.x - this.px, z.y - this.py);
+
+      // Audible grab windup: retreat can cancel it; a successful hold finishes before distraction checks.
+      if (z.kind !== "crawler" && z.kind !== "boss" && this.grabbedBy === null && this.grabProtection <= 0 && !this.director?.hidden) {
+        if (z.grabWindup > 0) {
+          if (playerDist > TACTICAL.ai.grabRange + 10 || !playerSeen) {
+            z.grabWindup = 0;
+          } else {
+            z.grabWindup -= dt;
+            z.alertMark = 0.5;
+            if (z.grabWindup <= 0 && playerDist <= TACTICAL.ai.grabRange + 4) {
+              this.grabbedBy = z.id;
+              this.grabStruggles = 0;
+              this.grabTick = 0.65;
+              z.grabCd = 7;
+              this.damagePlayer(4, z.x, z.y);
+              this.say("Zombie powala cię! ODPCHNIJ — pięć osobnych naciśnięć E.");
+              this.emitHud(true);
+              continue;
+            }
+          }
+          continue;
+        }
+        if (playerSeen && playerDist < TACTICAL.ai.grabRange && z.grabCd <= 0) {
+          z.grabWindup = TACTICAL.ai.grabWindup;
+          z.grabCd = 7;
+          z.alertMark = 1;
+          this.sfx.groan(this.time, z.kind);
+          continue;
+        }
+      }
+
       // Zombie wolą gracza; cywila atakują, gdy jest naprawdę blisko lub gdy gracz zniknął z oczu.
       const useCiv = !!civTarget && (civDist < 4.5 * TILE || (!playerSeen && civDist < playerDist * 0.7));
-      const see = playerSeen || useCiv;
-      const tgX = useCiv && civTarget ? civTarget.x : this.px;
-      const tgY = useCiv && civTarget ? civTarget.y : this.py;
+      const seesTarget = this.updateZombieStimulus(z, playerSeen, playerDist);
+      const see = seesTarget || useCiv;
+      const tgX = useCiv && civTarget ? civTarget.x : see ? this.px : z.lastX;
+      const tgY = useCiv && civTarget ? civTarget.y : see ? this.py : z.lastY;
       if (see && z.state !== "chase") z.alertMark = 0.9;
       if (see) {
         z.state = "chase";
@@ -1747,7 +2906,7 @@ export class Game {
           const n = z.path[0];
           if (this.tileAt(n.x, n.y) === 2) {
             const door = this.doorAt(n.x, n.y);
-            if (door && !door.open && !door.broken && !door.locked && z.bashT <= 0) {
+            if (door && !door.open && !door.broken && !door.locked && !door.sealed && !door.route && z.bashT <= 0) {
               z.bashT = z.kind === "brute" ? 0.7 : 0.85;
               door.hp -= z.kind === "brute" ? 2 : 1;
               this.sfx.bash();
@@ -1771,16 +2930,58 @@ export class Game {
         } else if (see) {
           this.stepZombie(z, tgX, tgY, dt);
         }
-        if (distP < z.r + 4.4 + 3 && z.attackCd <= 0) {
+        const contactDistance = useCiv ? civDist : playerDist;
+        if (contactDistance < z.r + 4.4 + 3 && z.attackCd <= 0) {
           z.attackCd = z.attackEvery;
           z.dir = dirFrom(Math.atan2(tgY - z.y, tgX - z.x));
-          if (useCiv && civTarget) this.director?.hurtCiv(civTarget, z.dmg, civTarget.x - z.x, civTarget.y - z.y);
+          if (useCiv && civTarget) this.director?.hurtCiv(civTarget, z.dmg, civTarget.x - z.x, civTarget.y - z.y, false);
           else if (!this.director?.hidden || this.director.isWitness(z.id)) this.damagePlayer(z.dmg, z.x, z.y);
         }
-        if (!see && z.alertT <= 0) z.state = "idle";
+        if (!see && Math.hypot(z.x - z.lastX, z.y - z.lastY) < 12) {
+          z.searchT -= dt;
+          if (z.searchT <= 0) {
+            z.searchT = TACTICAL.ai.searchSeconds;
+            z.lastX += (Math.random() - 0.5) * 4 * TILE;
+            z.lastY += (Math.random() - 0.5) * 4 * TILE;
+            z.pathT = 0;
+          }
+          if (this.tactical && this.tactical.clock > z.stimulusUntil) z.stimulus = null;
+        }
+        if (!see && z.alertT <= 0) { z.state = "idle"; z.stimulus = null; }
         if (distP < 6.5 * TILE && !this.vis[this.idx(Math.floor(z.x / TILE), Math.floor(z.y / TILE))])
           this.sfx.groan(this.time, z.kind);
       } else {
+        const patrolRoom = this.data().rooms[z.home];
+        if (!z.patrol.length && patrolRoom && this.data().roomZones[z.home] === "KORYTARZ") {
+          z.patrol = [0.15, 0.5, 0.85].map((part) => ({
+            x: patrolRoom.x + Math.max(1, Math.floor(patrolRoom.w * part)),
+            y: patrolRoom.y + 1,
+          }));
+          z.patrolIndex = Math.floor(Math.random() * z.patrol.length);
+        }
+        if (z.patrol.length) {
+          const target = z.patrol[z.patrolIndex % z.patrol.length];
+          z.patrolPause -= dt;
+          if (z.patrolPause > 0) continue;
+          const tx = (target.x + 0.5) * TILE, ty = (target.y + 0.5) * TILE;
+          if (Math.hypot(z.x - tx, z.y - ty) < 7) {
+            z.patrolIndex = (z.patrolIndex + 1) % z.patrol.length;
+            z.patrolPause = 1.2 + Math.random() * 2.4;
+            z.path = [];
+          } else {
+            z.pathT -= dt;
+            if (z.pathT <= 0 || !z.path.length) {
+              z.pathT = 0.7;
+              z.path = astar(this.data().w, this.data().h, Math.floor(z.x / TILE), Math.floor(z.y / TILE), target.x, target.y, (x, y) => this.walkable(x, y, false)) ?? [];
+            }
+            if (z.path.length) {
+              const n = z.path[0];
+              this.stepZombie(z, (n.x + 0.5) * TILE, (n.y + 0.5) * TILE, dt, 0.52);
+              if (Math.hypot(z.x - (n.x + 0.5) * TILE, z.y - (n.y + 0.5) * TILE) < 5) z.path.shift();
+            } else this.stepZombie(z, tx, ty, dt, 0.52);
+          }
+          continue;
+        }
         z.wanderT -= dt;
         if (z.wanderT <= 0) {
           z.wanderT = 2 + Math.random() * 2.5;
@@ -1838,7 +3039,8 @@ export class Game {
     const dx = tx - z.x;
     const dy = ty - z.y;
     const len = Math.hypot(dx, dy) || 1;
-    const step = z.speed * mul * dt;
+    const pace = this.environment?.inSteam(z.x, z.y) ? 0.52 : this.environment?.slow(z.id) ? 0.62 : 1;
+    const step = z.speed * mul * dt * pace;
     const n = this.moveBody(z.x, z.y, z.r, (dx / len) * step, (dy / len) * step);
     z.x = n.x;
     z.y = n.y;
@@ -1859,6 +3061,10 @@ export class Game {
         b.life = 0;
         this.burst(b.x, b.y, "#f0b868", 4, 42, true);
         this.burst(b.x, b.y, "#cbb89a", 3, 28);
+        continue;
+      }
+      if (!b.foe && this.hitBarrelAt(b.x, b.y, false)) {
+        b.life = 0;
         continue;
       }
       if (b.foe) {
@@ -2204,7 +3410,7 @@ export class Game {
   }
 
   private interact() {
-    if (!this.floor || this.paused || this.dead || this.interactLock > 0 || this.transition) return;
+    if (!this.floor || this.paused || this.dead || this.grabbedBy !== null || this.interactLock > 0 || this.transition) return;
     if (this.activeDialog) {
       this.advanceDialog();
       return;
@@ -2212,6 +3418,35 @@ export class Game {
     if (this.director?.choice) return;
     if (this.director?.hidden) {
       this.toggleHide();
+      return;
+    }
+    // Prefer the nearest meaningful target. A wardrobe close to a radio must not disable the radio.
+    const hideSpot = this.director?.nearHideSpot();
+    if (hideSpot) {
+      const hideDistance = Math.hypot((hideSpot.x + hideSpot.w / 2) * TILE - this.px, (hideSpot.y + hideSpot.h / 2) * TILE - this.py);
+      let deviceDistance = Infinity;
+      for (const p of this.data().props) {
+        if (p.kind !== "radio" && p.kind !== "tv") continue;
+        if (this.closeEnough({ x: p.x, y: p.y }, 25)) {
+          deviceDistance = Math.min(deviceDistance, Math.hypot((p.x + 0.5) * TILE - this.px, (p.y + 0.5) * TILE - this.py));
+        }
+      }
+      if (hideDistance <= deviceDistance + 1) {
+        this.toggleHide();
+        this.emitHud(true);
+        return;
+      }
+    }
+    if (this.interactVertical()) {
+      this.emitHud(true);
+      return;
+    }
+    if (this.interactTactical()) {
+      this.emitHud(true);
+      return;
+    }
+    if (this.environment?.use()) {
+      this.emitHud(true);
       return;
     }
     if (this.director?.interact()) {
@@ -2231,7 +3466,7 @@ export class Game {
     }
     for (const door of this.data().doors) {
       const dist = Math.hypot(this.px - (door.x + 0.5) * TILE, this.py - (door.y + 0.5) * TILE);
-      if (dist > 22 || door.broken) continue;
+      if (dist > 22 || door.broken || door.sealed || door.route) continue;
       cands.push({
         d: dist,
         run: () => {
@@ -2349,11 +3584,23 @@ export class Game {
       this.addPopup(cx, cy, p.loot === "bolts" ? "+4 BEŁTY" : "+4 ŁADUNKI ŚRUTU", COL.brass);
       this.sfx.pickup();
     } else if (isWeapon(p.loot)) {
-      discover(this.pack, p.loot);
-      this.say(`${WEAPONS[p.loot].name} w plecaku. Otwórz ekwipunek [I] i przypisz slot.`);
-      this.addPopup(cx, cy, `+ ${WEAPONS[p.loot].name.toUpperCase()}`, COL.fluor);
-      this.sfx.key();
-      this.burst(cx, cy + 8, COL.fluor, 10, 48, true);
+      const spec = WEAPONS[p.loot];
+      if (discover(this.pack, p.loot)) {
+        this.say(`${spec.name} w plecaku. Otwórz ekwipunek [I] i przypisz slot.`);
+        this.addPopup(cx, cy, `+ ${spec.name.toUpperCase()}`, COL.fluor);
+        this.sfx.key();
+        this.burst(cx, cy + 8, COL.fluor, 10, 48, true);
+      } else {
+        this.pack.stock[spec.ammo ?? "rounds"] += 4;
+        this.say(`Masz ju\u017c t\u0119 bro\u0144. Ze skrytki zabierasz amunicj\u0119.`);
+        this.addPopup(cx, cy, "+4 AMUNICJI", COL.brass);
+        this.sfx.pickup();
+      }
+    } else if (p.loot === "fuse") {
+      this.questState().fuseTaken = true;
+      this.sfx.key(); this.burst(cx, cy + 8, COL.brass, 8, 42, true);
+      this.addJournal("Zapasowy bezpiecznik windy. Na obudowie wybite: B-4.");
+      this.updateVerticalQuest();
     } else if (p.loot === "key") {
       this.hasKey = true;
       if (this.floor) this.floor.hasKey = true;
@@ -2375,6 +3622,7 @@ export class Game {
   private reachProp(p: Prop) {
     let nearest = Infinity;
     const sx = Math.floor(this.px / TILE), sy = Math.floor(this.py / TILE);
+    if (this.environment?.roomHidden(this.data().roomOf[this.idx(p.x, p.y)])) return nearest;
     for (let y = p.y; y < p.y + p.h; y++) for (let x = p.x; x < p.x + p.w; x++) {
       const dx = (x + 0.5) * TILE - this.px, dy = (y + 0.5) * TILE - this.py;
       const dist = Math.hypot(dx, dy);
@@ -2383,18 +3631,559 @@ export class Game {
     return nearest;
   }
 
-  private requestFloor(dir: number) {
+  private requestFloor(dir: number, route: "stairs" | "service" | "stairsB" = "stairs") {
     const next = this.floorIndex + dir;
-    if (next < 0 || next >= FLOOR_COUNT || this.transition) return;
-    if (dir > 0 && this.data().doors.some((d) => d.locked)) {
+    if (next < 0 || next >= FLOOR_COUNT || this.transition || this.building.passage || this.building.elevatorRide) return;
+    if (route === "stairs" && dir > 0 && this.data().doors.some((d) => d.locked)) {
       this.say("Schody za zamkniętymi drzwiami.");
       return;
     }
-    this.transition = { dir, t: 0, phase: "out" };
+    if (route === "service" && !this.data().vertical?.service) return;
+    if (route === "stairsB" && !this.data().vertical?.stairsB) return;
+
+    const v = this.data().vertical;
+    const qs = this.questState();
+    const passageRoute: PassageState["route"] =
+      route === "service" ? "service" : route === "stairsB" ? "stairsB" : "stairsA";
+    const feature =
+      passageRoute === "stairsA" && v
+        ? v.landingFeature
+        : passageRoute === "stairsB"
+          ? "window"
+          : "empty";
+
+    this.building.passage = {
+      from: this.floorIndex,
+      to: next,
+      route: passageRoute,
+      x: passageRoute === "service" ? 72 : 34,
+      y: passageRoute === "service" ? 86 : 92,
+      feature,
+      stashLooted: qs.landingStashOpened,
+      bypassProgress: qs.landingBypassOpen ? 1 : 0,
+      bypassOpen: qs.landingBypassOpen,
+      soundPlayed: false,
+    };
+    this.releaseInput();
     this.sfx.door(true);
+    if (feature === "broken-flight" && !qs.inspected) {
+      qs.inspected = true;
+      qs.stage = Math.max(qs.stage, 1);
+      this.addJournal("Klatka A: górny bieg schodów jest zawalony! Na półpiętrze widać zastawione drzwi zaplecza technicznego.");
+    } else if (passageRoute === "service") {
+      this.addJournal(`Pion techniczny: wspinasz się drabiną między ${floorShortName(this.floorIndex)} a ${floorShortName(next)}.`);
+    }
+  }
+
+  private finishPassage(targetFloor: number, arrival: "up" | "down" | "service" | "stairsB") {
+    this.building.passage = null;
+    this.verticalWork = null;
+    this.sfx.door(true);
+    if (targetFloor === this.floorIndex) {
+      this.say("Wracasz na poprzednie piętro.");
+      this.emitHud(true);
+      return;
+    }
+    this.enter(targetFloor, arrival);
+  }
+
+  private tileCenter(p: Cell) { return { x: (p.x + 0.5) * TILE, y: (p.y + 0.5) * TILE }; }
+
+  private closeEnough(p: Cell, radius = 23) {
+    const c = this.tileCenter(p);
+    return Math.hypot(c.x - this.px, c.y - this.py) <= radius && this.rayClear(Math.floor(this.px / TILE), Math.floor(this.py / TILE), p.x, p.y);
+  }
+
+  private inLiftCabin(lift: { cells: Cell[] }) {
+    const p = { x: Math.floor(this.px / TILE), y: Math.floor(this.py / TILE) };
+    return lift.cells.some((c) => c.x === p.x && c.y === p.y);
+  }
+
+  private serviceLiftState() {
+    return this.building.serviceLift ??= { floor: this.floorIndex, openFloor: null, arrival: 0, callFloor: -1 };
+  }
+
+  private startFreightCall() {
+    const state = this.serviceLiftState();
+    if (state.openFloor === this.floorIndex) {
+      this.offerServiceRoute();
+      return;
+    }
+    if (state.arrival > 0 && state.callFloor === this.floorIndex) return;
+    state.callFloor = this.floorIndex;
+    state.arrival = 1.5;
+    this.sfx.liftCall();
+    this.alert(this.px, this.py, 8 * TILE, true);
+    this.say("Winda serwisowa nadjeżdża. Usłysz mechanizm i przygotuj wyjście z kabiny.");
+  }
+
+  private offerServiceRoute() {
+    const state = this.serviceLiftState();
+    const next = this.floorIndex < 9 ? this.floorIndex + 1 : this.floorIndex - 1;
+    this.verticalChoice = {
+      mode: "service",
+      targets: [next, next, null],
+      labels: [state.openFloor === this.floorIndex && this.inLiftCabin(this.data().vertical!.service!)
+        ? `Jedź windą serwisową → ${floorShortName(next)}` : "Wejdź do kabiny serwisowej",
+        `Drabina / właz → ${floorShortName(next)}`, "Zostań na piętrze"],
+      label: "PION TECHNICZNY",
+      text: state.openFloor === this.floorIndex
+        ? "Kabina czeka. Wejdź do środka, by ruszyć, albo wybierz drabinę."
+        : "Możesz przywołać windę serwisową lub pokonać pion drabiną.",
+    };
+    this.emitHud(true);
+  }
+
+  private startFreightRide() {
+    const service = this.data().vertical?.service;
+    const state = this.serviceLiftState();
+    const next = this.floorIndex < 9 ? this.floorIndex + 1 : this.floorIndex - 1;
+    if (state.openFloor !== this.floorIndex) {
+      this.startFreightCall();
+      return;
+    }
+    if (!service || !this.inLiftCabin(service)) {
+      this.say("Wejdź do otwartej kabiny serwisowej przed uruchomieniem przejazdu.");
+      return;
+    }
+    this.building.elevatorRide = {
+      from: this.floorIndex, to: next, elapsed: 0, phase: "doors", variant: "routine", kind: "freight",
+      cabinX: 0, cabinY: 0, doorOpen: 1, leverProgress: 0,
+    };
+    state.openFloor = null;
+    state.callFloor = -1;
+    this.syncVerticalDoors();
+    this.releaseInput();
+    this.sfx.door(false);
+    this.addJournal(`Winda serwisowa rusza z ${floorShortName(this.floorIndex)} do ${floorShortName(next)}.`);
+  }
+
+  private offerLiftFloors() {
+    const from = this.floorIndex;
+    const candidates = from === 0 ? [1, 2] : from >= 9 ? [8, 7] : [from + 1, from + 2 <= 9 ? from + 2 : from - 1];
+    const available = [...new Set(candidates)].filter((i) => i >= 0 && i <= 9 && i !== from && this.buildingLayout.elevatorStops.includes(i));
+    const targets: (number | null)[] = available.slice(0, 2);
+    const labels = available.slice(0, 2).map((i) => {
+      const dur = Math.min(5, Math.max(3, Math.round(2.8 + Math.abs(i - from) * 0.6)));
+      return `${i > from ? "↑" : "↓"}  ${floorShortName(i)} (~${dur} s)`;
+    });
+    targets.push(null);
+    labels.push("Pozostań w kabinie");
+    const statusText = this.building.elevatorEmergencyOnly
+      ? "Tryb awaryjny: ograniczona sprawność (jeden przejazd). Wybierz piętro:"
+      : "Panel windy aktywny. Wybierz docelową kondygnację:";
+    this.verticalChoice = { targets, labels, label: "PANEL WINDY OSOBOWEJ", text: statusText };
+    this.emitHud(true);
+  }
+
+  private startLiftCall() {
+    if (!this.building.elevatorPowered || this.building.elevatorBroken) return false;
+    if (this.building.elevatorOpenFloor === this.floorIndex) {
+      this.say("Drzwi windy są otwarte. Wejdź do kabiny i użyj panelu.");
+      this.sfx.liftCall();
+      return true;
+    }
+    if (this.building.elevatorArrival > 0 && this.building.elevatorCallFloor === this.floorIndex) return true;
+    this.building.elevatorCallFloor = this.floorIndex;
+    this.building.elevatorArrival = Math.min(3.4, 1.3 + Math.abs(this.building.elevatorFloor - this.floorIndex) * 0.35);
+    this.sfx.liftCall();
+    this.alert(this.px, this.py, 9 * TILE, true);
+    this.noise = 0.8;
+    this.addJournal("Przywołano windę — dźwięk napędu może ściągnąć zombie w korytarzu.");
+    return true;
+  }
+
+  private startLiftRide(target: number) {
+    const lift = this.data().vertical?.elevator;
+    if (!lift || this.building.elevatorBroken || !this.building.elevatorPowered || this.building.elevatorOpenFloor !== this.floorIndex || !this.inLiftCabin(lift)) {
+      this.say("Wejdź do otwartej kabiny, aby uruchomić przejazd.");
+      return;
+    }
+    if (target < 0 || target > 9 || target === this.floorIndex || !this.buildingLayout.elevatorStops.includes(target)) return;
+    const isEmergencyFault = this.building.elevatorEmergencyOnly && !this.building.elevatorFaultUsed && target > this.floorIndex;
+    let variant = isEmergencyFault ? "fault" : this.buildingLayout.elevatorVariants[Math.min(this.floorIndex, 9)] ?? "routine";
+    // Cap dramatic / special elevator events per run so most trips remain dependable
+    if (!isEmergencyFault && variant !== "routine" && this.building.elevatorSpecialCount >= 2) {
+      variant = "routine";
+    }
+    if (!isEmergencyFault && variant !== "routine") {
+      this.building.elevatorSpecialCount += 1;
+    }
+    if (isEmergencyFault) this.building.elevatorFaultUsed = true;
+
+    const stopFloor =
+      variant === "stop" && Math.abs(target - this.floorIndex) >= 2
+        ? this.floorIndex + Math.sign(target - this.floorIndex)
+        : undefined;
+    if (variant === "stop" && stopFloor === undefined) variant = "rattle";
+
+    this.building.elevatorRide = {
+      from: this.floorIndex,
+      to: target,
+      elapsed: 0,
+      phase: "doors",
+      variant,
+      cabinX: 0,
+      cabinY: 0,
+      doorOpen: 1,
+      leverProgress: 0,
+      ...(stopFloor !== undefined ? { stopFloor } : {}),
+    };
+    this.building.elevatorOpenFloor = null;
+    this.building.elevatorCallFloor = -1;
+    this.syncVerticalDoors();
+    this.releaseInput();
+    this.sfx.door(false);
+    this.addJournal(`Winda zamyka drzwi: ${floorShortName(this.floorIndex)} → ${floorShortName(target)}.`);
+  }
+
+  private tickVertical(dt: number) {
+    if (this.building.elevatorArrival > 0) {
+      this.building.elevatorArrival = Math.max(0, this.building.elevatorArrival - dt);
+      if (this.building.elevatorArrival === 0 && this.building.elevatorCallFloor >= 0) {
+        const target = this.building.elevatorCallFloor;
+        this.building.elevatorFloor = target;
+        this.building.elevatorOpenFloor = target;
+        this.building.elevatorCallFloor = -1;
+        this.syncVerticalDoors(target);
+        this.sfx.liftStop();
+        this.shake = Math.max(this.shake, 1.0);
+        this.addJournal(`Kabina przyjechała na ${floorShortName(target)}. Drzwi rozsuwają się.`);
+      }
+    }
+    const freight = this.building.serviceLift;
+    if (freight && freight.arrival > 0) {
+      freight.arrival = Math.max(0, freight.arrival - dt);
+      if (freight.arrival === 0 && freight.callFloor >= 0) {
+        const target = freight.callFloor;
+        freight.floor = target;
+        freight.openFloor = target;
+        freight.callFloor = -1;
+        this.syncVerticalDoors(target);
+        this.sfx.liftStop();
+        this.say("Kabina serwisowa otwiera się na tym piętrze.");
+      }
+    }
+  }
+
+  private updateVerticalHold(dt: number) {
+    this.verticalWork = null;
+    if (this.director?.hidden || this.director?.choice || this.verticalChoice || this.activeDialog) return;
+    const holding = this.keys.has("KeyE") || this.touchHold;
+    const vertical = this.data().vertical;
+    const quest = vertical?.quest;
+    if (!quest || !vertical) return;
+    const qs = this.questState();
+
+    // Scenario E alternative: force service shaft door with crowbar/hatchet (loud!)
+    if (quest.kind === "service-shaft" && !qs.serviceUnlocked && !qs.serviceForced && !qs.codeFound && vertical.service && this.closeEnough(vertical.service.panel, 24)) {
+      const hasTool = this.pack.owned.includes("crowbar") || this.pack.owned.includes("hatchet");
+      if (hasTool) {
+        this.verticalWork = { label: "wyważ zamek pionu (głośno)", progress: qs.bypassProgress, active: holding };
+        if (holding) {
+          qs.bypassProgress = Math.min(1, qs.bypassProgress + dt / 2.2);
+          this.stamina = Math.max(0, this.stamina - 10 * dt);
+          if (Math.random() < dt * 3.5) {
+            const c = this.tileCenter(vertical.service.door);
+            this.sfx.hit(true);
+            this.burst(c.x, c.y, "#f0b050", 4, 38, true);
+            this.alert(c.x, c.y, 12 * TILE, true);
+            this.noise = 0.9;
+          }
+          if (qs.bypassProgress >= 1) {
+            qs.serviceForced = true;
+            qs.stage = 3;
+            qs.resolved = true;
+            this.syncVerticalDoors();
+            this.sfx.bash();
+            this.shake = 2.4;
+            this.addJournal("Sforsowano zamek pionu technicznego! Hałas odbił się echem po piętrze.");
+          }
+        }
+      }
+      return;
+    }
+
+    // Scenario F: push heavy apartment obstacle to unlock Klatka B permanently
+    if (quest.kind === "apartment-bypass" && quest.bypassCell && !qs.bypassOpen && this.closeEnough(quest.bypassCell, 25)) {
+      this.verticalWork = { label: "odsuń mebel do Klatki B", progress: qs.bypassProgress, active: holding };
+      if (holding) {
+        qs.bypassProgress = Math.min(1, qs.bypassProgress + dt / 2.4);
+        this.stamina = Math.max(0, this.stamina - 9 * dt);
+        if (Math.random() < dt * 3) {
+          const c = this.tileCenter(quest.bypassCell);
+          this.sfx.environment("scrape", 0.7);
+          this.burst(c.x, c.y, "#a08a69", 3, 24);
+          this.alert(c.x, c.y, 7 * TILE, true);
+        }
+        if (qs.bypassProgress >= 1) {
+          qs.bypassOpen = true;
+          qs.stage = 3;
+          qs.resolved = true;
+          this.syncVerticalDoors();
+          this.sfx.door(true);
+          this.addJournal("Przejście przez wschodnie mieszkanie odsłonięte — Klatka B jest na stałe dostępna.");
+        }
+      }
+    }
+  }
+
+  private updateLiftRide(dt: number) {
+    const ride = this.building.elevatorRide;
+    if (!ride) return;
+    // Allow player to move inside cabin, rotate aim, and use flashlight (except during brief jolt)
+    const canMove = ride.phase !== "jolt";
+    const mx = (this.keys.has("KeyD") || this.keys.has("ArrowRight") ? 1 : 0) - (this.keys.has("KeyA") || this.keys.has("ArrowLeft") ? 1 : 0);
+    const my = (this.keys.has("KeyS") || this.keys.has("ArrowDown") ? 1 : 0) - (this.keys.has("KeyW") || this.keys.has("ArrowUp") ? 1 : 0);
+    const moveX = Math.abs(this.touchMove.x) > 0.2 ? this.touchMove.x : mx;
+    const moveY = Math.abs(this.touchMove.y) > 0.2 ? this.touchMove.y : my;
+    this.moving = canMove && (moveX !== 0 || moveY !== 0);
+    if (this.moving) {
+      const n = Math.hypot(moveX, moveY) || 1;
+      ride.cabinX = Math.max(-24, Math.min(24, ride.cabinX + (moveX / n) * dt * 34));
+      ride.cabinY = Math.max(-18, Math.min(20, ride.cabinY + (moveY / n) * dt * 34));
+      this.animT += dt * 7;
+    }
+    this.aim = Math.atan2(this.mouseSY - (this.viewH / 2 + 4 + ride.cabinY), this.mouseSX - (this.viewW / 2 + ride.cabinX));
+    this.dir = dirFrom(this.aim);
+    if (this.flashOn) {
+      this.battery = Math.max(0, this.battery - 0.12 * dt);
+      if (this.battery <= 0) this.flashOn = false;
+    }
+
+    if (ride.phase === "doors") {
+      ride.elapsed += dt;
+      ride.doorOpen = Math.max(0, 1 - ride.elapsed / 0.7);
+      if (ride.elapsed >= 0.7) {
+        ride.phase = "accel";
+        ride.elapsed = 0;
+        this.shake = Math.max(this.shake, 1.5);
+        this.sfx.liftMove();
+      }
+    } else if (ride.phase === "accel") {
+      ride.elapsed += dt;
+      if (ride.elapsed >= 0.9) {
+        ride.phase = "moving";
+        ride.elapsed = 0;
+      }
+    } else if (ride.phase === "moving") {
+      ride.elapsed += dt;
+      const floors = Math.abs(ride.to - ride.from);
+      const duration = ride.variant === "fault" ? 3.2 : Math.min(4.8, 2.6 + floors * 0.55);
+      if (ride.variant === "rattle" && Math.floor(ride.elapsed * 2.2) !== Math.floor((ride.elapsed - dt) * 2.2)) {
+        this.sfx.liftRattle();
+        this.shake = Math.max(this.shake, 1.6);
+      }
+      if (ride.variant === "threat" && !ride.threatWarned && ride.elapsed >= duration - 0.8) {
+        ride.threatWarned = true;
+        this.sfx.groan(this.time, "brute");
+        this.say("Za drzwiami na górze słychać kroki i pomruki...");
+      }
+      if (ride.variant === "stop" && ride.stopFloor !== undefined && ride.elapsed >= duration * 0.5) {
+        ride.phase = "stop";
+        ride.elapsed = 0;
+        ride.doorOpen = 0.65;
+        this.building.elevatorFloor = ride.stopFloor;
+        this.sfx.liftStop();
+        this.verticalChoice = {
+          targets: [null, ride.to],
+          labels: [`Wysiądź (${floorShortName(ride.stopFloor)})`, `Jedź dalej (${floorShortName(ride.to)})`],
+          label: "NIEPLANOWANY POSTÓJ",
+          text: `Kabina zatrzymała się na pośredniej kondygnacji (${floorShortName(ride.stopFloor)}).`,
+        };
+        this.addJournal(`Nieplanowany postój windy na ${floorShortName(ride.stopFloor)}.`);
+      } else if (ride.elapsed >= duration) {
+        if (ride.kind === "freight") this.serviceLiftState().floor = ride.to;
+        else this.building.elevatorFloor = ride.to;
+        this.sfx.liftStop();
+        if (ride.variant === "fault") {
+          ride.phase = "jolt";
+          ride.elapsed = 0;
+          this.shake = 6.2;
+          this.hurt = 0.42;
+          this.environmentHit = true;
+          this.sfx.liftRattle();
+          this.sfx.powerDown();
+          this.addJournal(`Wskaźnik potwierdził ${floorShortName(ride.to)}, po czym kabina gwałtownie stanęła. Zgasło główne światło.`);
+        } else if (ride.variant === "mid-shaft") {
+          ride.phase = "ledge";
+          ride.elapsed = 0;
+          this.shake = 3.2;
+          this.sfx.liftRattle();
+          this.addJournal("Kabina zatrzymała się przy podeście technicznym. Uchyla się właz serwisowy.");
+        } else {
+          ride.phase = "arrive";
+          ride.elapsed = 0;
+        }
+      }
+    } else if (ride.phase === "jolt") {
+      ride.elapsed += dt;
+      if (ride.elapsed > 1.1 && ride.elapsed - dt <= 1.1) {
+        this.sfx.environment("switch", 0.5);
+        this.say("Włącza się awaryjne oświetlenie. Panel drzwi nie działa.");
+      }
+      if (ride.elapsed >= 2.1) {
+        ride.phase = "stranded";
+        ride.elapsed = 0;
+        this.say("Użyj czerwonej dźwigni awaryjnej po prawej [E], aby uchylić drzwi.");
+      }
+    } else if (ride.phase === "stranded") {
+      ride.elapsed += dt;
+    } else if (ride.phase === "escape") {
+      ride.elapsed += dt;
+      ride.doorOpen = Math.min(0.7, ride.elapsed / 1.1);
+      if (ride.elapsed >= 1.2) {
+        const target = ride.to;
+        this.building.elevatorBroken = true;
+        this.building.elevatorEmergencyOnly = false;
+        this.building.elevatorFloor = target;
+        this.building.elevatorOpenFloor = target;
+        this.building.elevatorRide = null;
+        this.addJournal(`Drzwi awaryjne ustąpiły na ${floorShortName(target)}. Winda wymaga resetu przekaźnika.`);
+        this.enter(target, "lift");
+      }
+    } else if (ride.phase === "ledge") {
+      ride.elapsed += dt;
+      if (ride.elapsed >= 1.1) {
+        const from = ride.from;
+        const target = ride.to;
+        this.building.elevatorFloor = target;
+        this.building.elevatorOpenFloor = target;
+        this.building.elevatorRide = null;
+        this.building.passage = {
+          from,
+          to: target,
+          route: "ledge",
+          x: 72,
+          y: 80,
+          feature: "empty",
+          stashLooted: true,
+          bypassProgress: 1,
+          bypassOpen: true,
+          soundPlayed: false,
+        };
+        this.say("Wychodzisz na podest techniczny. Wspnij się przez właz na właściwe piętro.");
+      }
+    } else if (ride.phase === "arrive") {
+      ride.elapsed += dt;
+      ride.doorOpen = Math.min(1, ride.elapsed / 0.65);
+      if (ride.elapsed >= 0.75) {
+        const target = ride.to;
+        if (ride.kind === "freight") {
+          this.serviceLiftState().openFloor = target;
+          this.building.elevatorRide = null;
+          this.addJournal(`Winda serwisowa zatrzymała się na podeście technicznym ${floorShortName(target)}.`);
+          this.enter(target, "service");
+        } else {
+          this.building.elevatorOpenFloor = target;
+          this.building.elevatorRide = null;
+          this.enter(target, "lift");
+        }
+      }
+    }
+  }
+
+  private updatePassage(dt: number) {
+    const p = this.building.passage;
+    if (!p) return;
+    this.verticalWork = null;
+
+    // Distant ambient cue from the floor above once player reaches landing
+    if (!p.soundPlayed && p.y < 36) {
+      p.soundPlayed = true;
+      if (this.data().vertical?.landingSoundHint) {
+        this.sfx.groan(this.time, "shambler");
+      }
+    }
+
+    const holding = this.keys.has("KeyE") || this.touchHold;
+    if (p.feature === "broken-flight" && !p.bypassOpen && Math.hypot(p.x - 120, p.y - 22) < 28) {
+      this.verticalWork = { label: "odsuń przeszkodę do zaplecza", progress: p.bypassProgress, active: holding };
+      if (holding) {
+        p.bypassProgress = Math.min(1, p.bypassProgress + dt / 2.2);
+        this.stamina = Math.max(0, this.stamina - 9 * dt);
+        if (Math.random() < dt * 3) this.sfx.environment("scrape", 0.6);
+        if (p.bypassProgress >= 1) {
+          p.bypassOpen = true;
+          const qs = this.questState(p.from);
+          qs.landingBypassOpen = true;
+          qs.stage = 3;
+          qs.resolved = true;
+          this.sfx.door(true);
+          this.addJournal("Odsłonięto przejście przez zaplecze techniczne na półpiętrze! Możesz przejść wyżej.");
+        }
+        return;
+      }
+    }
+
+    const mx = (this.keys.has("KeyD") || this.keys.has("ArrowRight") ? 1 : 0) - (this.keys.has("KeyA") || this.keys.has("ArrowLeft") ? 1 : 0);
+    const my = (this.keys.has("KeyS") || this.keys.has("ArrowDown") ? 1 : 0) - (this.keys.has("KeyW") || this.keys.has("ArrowUp") ? 1 : 0);
+    const moveX = Math.abs(this.touchMove.x) > 0.2 ? this.touchMove.x : mx;
+    const moveY = Math.abs(this.touchMove.y) > 0.2 ? this.touchMove.y : my;
+    this.moving = moveX !== 0 || moveY !== 0;
+
+    if (this.moving) {
+      const len = Math.hypot(moveX, moveY) || 1;
+      const spd = p.route === "service" || p.route === "ledge" ? 56 : 66;
+      const nx = p.x + (moveX / len) * spd * dt;
+      const ny = p.y + (moveY / len) * spd * dt;
+      const canStand = (x: number, y: number) => {
+        if (p.route === "service" || p.route === "ledge") {
+          return x >= 34 && x <= 110 && y >= 14 && y <= 94;
+        }
+        if (x < 14 || x > PASSAGE_W - 14 || y < 14 || y > PASSAGE_H - 12) return false;
+        // Central stairwell divider wall (x 60..84, y 36..108)
+        if (x > 58 && x < 86 && y > 35) return false;
+        // Landing obstacle crate (x 62..82, y 15..29)
+        if (p.feature === "obstacle" && x > 60 && x < 84 && y > 13 && y < 30) return false;
+        // Collapsed rubble blocking upper right flight
+        if (p.feature === "broken-flight" && x > 82 && y > 38) return false;
+        return true;
+      };
+      if (canStand(nx, p.y)) p.x = nx;
+      if (canStand(p.x, ny)) p.y = ny;
+      this.animT += dt * 9;
+      this.stepT -= dt;
+      if (this.stepT <= 0) {
+        this.stepT = 0.34;
+        if (p.route === "service" || p.route === "ledge") this.sfx.ladder();
+        else this.sfx.step(this.time, "concrete");
+      }
+    }
+
+    const ox = Math.round((this.viewW - PASSAGE_W) / 2);
+    const oy = Math.round((this.viewH - PASSAGE_H) / 2);
+    this.aim = Math.atan2(this.mouseSY - (oy + p.y), this.mouseSX - (ox + p.x));
+    this.dir = dirFrom(this.aim);
+    if (this.flashOn) {
+      this.battery = Math.max(0, this.battery - 0.12 * dt);
+      if (this.battery <= 0) this.flashOn = false;
+    }
+
+    // Walking all the way into the exit doorway automatically transitions cleanly!
+    if (p.route === "service" || p.route === "ledge") {
+      if (p.y <= 16) this.finishPassage(p.to, "service");
+      else if (p.y >= 93 && moveY > 0.2) this.finishPassage(p.from, "service");
+    } else {
+      if (p.feature === "broken-flight" && p.bypassOpen && p.x >= 122 && p.y <= 18) {
+        this.finishPassage(p.to, "stairsB");
+      } else if (p.x > 88 && p.y >= 99 && p.feature !== "broken-flight") {
+        this.finishPassage(p.to, p.route === "stairsB" ? "stairsB" : p.to > p.from ? "up" : "down");
+      } else if (p.x < 56 && p.y >= 99 && moveY > 0.2) {
+        this.finishPassage(p.from, p.route === "stairsB" ? "stairsB" : p.to > p.from ? "down" : "up");
+      }
+    }
   }
 
   private currentZone() {
+    if (this.building.elevatorRide) {
+      return `WINDA OSOBOWA · POZIOM ${floorTag(this.building.elevatorFloor)}`;
+    }
+    const p = this.building.passage;
+    if (p) {
+      const name = p.route === "stairsB" ? "KLATKA B" : p.route === "service" ? "PION TECHNICZNY" : p.route === "ledge" ? "PODEST TECHNICZNY" : "KLATKA A";
+      return `${name} · MIĘDZY ${floorShortName(p.from)} I ${floorShortName(p.to)}`;
+    }
     if (!this.floor) return "";
     const tx = Math.floor(this.px / TILE);
     const ty = Math.floor(this.py / TILE);
@@ -2405,6 +4194,17 @@ export class Game {
   }
 
   private objective() {
+    const ride = this.building.elevatorRide;
+    if (ride) {
+      if (ride.phase === "stranded") return "Otwórz drzwi awaryjnie";
+      if (ride.phase === "stop") return "Postój pośredni windy";
+      return `Winda → ${floorShortName(ride.to)}`;
+    }
+    const p = this.building.passage;
+    if (p) {
+      if (p.feature === "broken-flight" && !p.bypassOpen) return "Otwórz przejście przez zaplecze";
+      return `Dotrzyj na ${floorShortName(p.to)}`;
+    }
     const d = this.data();
     if (d.theme === "roof") {
       if (this.heliPhase === "landed") return "Wskakuj do śmigłowca!";
@@ -2412,13 +4212,54 @@ export class Game {
       if (!this.bossKilled) return "Zabij Wielkiego";
       return "Odpal flarę — przytrzymaj E";
     }
+    const q = d.vertical?.quest;
+    const qs = this.questState();
+    if (q && !qs.resolved) {
+      if (q.kind === "repair-lift") {
+        if (qs.stage === 0) return "Znajdź drogę na wyższe piętro";
+        if (qs.stage === 1) return "Odłącz zwarcie i zdobądź bezpiecznik";
+        if (qs.stage === 2) return "Odnajdź bezpiecznik B-4 w warsztacie";
+        if (qs.stage === 3) return "Przywróć zasilanie windy";
+        if (qs.stage === 4) return "Przywołaj windę";
+      }
+      if (q.kind === "broken-stairs" && qs.inspected) return "Omiń zawaloną klatkę";
+      if (q.kind === "flooded-route" && qs.inspected) return "Usuń zagrożenie w pionie technicznym";
+      if (q.kind === "lure-horde" && qs.inspected) return qs.lureUsed ? "Przejdź na klatkę schodową" : "Odciągnij zombie od klatki";
+      if (q.kind === "service-shaft" && qs.inspected) return qs.codeFound ? "Otwórz pion techniczny kodem" : "Zdobądź kod pionu lub sforsuj drzwi";
+      if (q.kind === "apartment-bypass" && qs.inspected) return "Przejdź przez mieszkanie do Klatki B";
+    }
     if (d.locked && d.doors.some((door) => door.locked) && !this.hasKey) return "Znajdź klucz do klatki";
     if (d.doors.some((door) => door.locked)) return "Otwórz drzwi na schody";
     return "Wejdź po schodach";
   }
 
-  private prompt() {
+  private prompt(environment = this.environment?.hint()) {
     if (!this.floor) return "";
+    const ride = this.building.elevatorRide;
+    if (ride) {
+      if (ride.phase === "stranded") return "E  pociągnij dźwignię awaryjną";
+      if (ride.phase === "stop") return "E  wybierz (wysiądź / jedź dalej)";
+      return "";
+    }
+    const p = this.building.passage;
+    if (p) {
+      if (this.verticalWork) return `E  przytrzymaj: ${this.verticalWork.label}`;
+      if ((p.feature === "stash" || p.feature === "traces") && !p.stashLooted && Math.hypot(p.x - 18, p.y - 16) < 26) {
+        return "E  przeszukaj schowek konserwatora";
+      }
+      if (p.feature === "broken-flight" && p.bypassOpen && Math.hypot(p.x - 126, p.y - 18) < 26) {
+        return `E  przejdź przez zaplecze na ${floorShortName(p.to)}`;
+      }
+      if (p.route === "service" || p.route === "ledge") {
+        if (p.y < 32) return `E  otwórz właz (${floorShortName(p.to)})`;
+        if (p.y > 84) return `E  wróć na ${floorShortName(p.from)}`;
+      } else {
+        if (p.x > 84 && p.y > 84 && p.feature !== "broken-flight") return `E  wyjdź na ${floorShortName(p.to)}`;
+        if (p.x < 60 && p.y > 84) return `E  wróć na ${floorShortName(p.from)}`;
+      }
+      return "";
+    }
+    if (this.verticalWork) return `E  przytrzymaj: ${this.verticalWork.label}`;
     let best = 30;
     let label = "";
     const consider = (d: number, text: string) => {
@@ -2427,16 +4268,58 @@ export class Game {
         label = text;
       }
     };
+    if (this.grabbedBy !== null) return `ODPCHNIJ ZOMBIE - E: ${this.grabStruggles}/5`;
     if (this.activeDialog) return "E  dalej";
+    if (environment) return `E  ${environment.hold ? "przytrzymaj: " : ""}${environment.label}`;
     const eventPrompt = this.director?.prompt();
     if (eventPrompt) return eventPrompt;
+    const v = this.data().vertical;
+    const q = v?.quest;
+    const qs = this.questState();
+    if (v?.elevator) {
+      if (this.inLiftCabin(v.elevator) && this.closeEnough(v.elevator.panel, 25)) {
+        consider(1, this.building.elevatorEmergencyOnly ? "E  panel windy (tryb awaryjny)" : "E  wybierz piętro w windzie");
+      } else if (this.closeEnough(v.elevator.call, 25)) {
+        if (q?.kind === "repair-lift" && qs.fuseTaken && !this.building.elevatorPowered) consider(2, "E  zamontuj bezpiecznik B-4");
+        else if (this.building.elevatorBroken && this.floorIndex >= 2) consider(2, "E  zresetuj przekaźnik windy");
+        else if (!this.building.elevatorPowered) consider(2, "E  sprawdź panel windy (brak zasilania)");
+        else if (this.building.elevatorOpenFloor === this.floorIndex) consider(2, "E  kabina gotowa (wejdź do środka)");
+        else consider(2, "E  przywołaj windę");
+      }
+    }
+    if (v?.service && (this.closeEnough(v.service.panel, 24) || this.closeEnough(v.service.door, 24))) {
+      if (q?.kind === "service-shaft" && !qs.serviceUnlocked && !qs.serviceForced) {
+        consider(3, qs.codeFound ? `E  wpisz kod ${q.code}` : "E  sprawdź zamek pionu");
+      } else if (q?.kind === "flooded-route" && qs.stage < 3) {
+        consider(3, "E  sprawdź zalany pion techniczny");
+      } else if (this.building.serviceLift?.openFloor === this.floorIndex && this.inLiftCabin(v.service)) {
+        consider(3, "E  winda serwisowa / drabina");
+      } else {
+        consider(3, "E  pion techniczny: winda serwisowa lub drabina");
+      }
+    }
+    if (v?.stairsB && (this.closeEnough(v.stairsB.stairs, 24) || this.closeEnough(v.stairsB.outside, 24))) {
+      consider(3, q?.kind === "apartment-bypass" && !qs.bypassOpen ? "E  zastawiona Klatka B" : "E  wejdź na Klatkę B");
+    }
+    if (q?.kind === "repair-lift" && q.fuseCell && !qs.fuseTaken && this.closeEnough(q.fuseCell, 25)) {
+      consider(2, "E  zabierz bezpiecznik B-4");
+    }
+    if (q?.kind === "lure-horde" && q.beacon && !qs.lureUsed && this.closeEnough(q.beacon, 25)) {
+      consider(2, "E  uruchom sygnał rozgłoszeniowy");
+    }
+    if (q?.kind === "service-shaft" && q.clueCell && !qs.codeFound && this.closeEnough(q.clueCell, 25)) {
+      consider(2, "E  przeczytaj instrukcję procedury");
+    }
+    if (q?.kind === "apartment-bypass" && q.clueCell && !qs.inspected && this.closeEnough(q.clueCell, 25)) {
+      consider(2, "E  sprawdź plan ewakuacyjny");
+    }
     for (const s of this.floor.survivors) {
       if (s.state !== "hide") continue;
       const dist = Math.hypot(this.px - s.x, this.py - s.y);
       if (dist < 28) consider(dist - 4, "E  porozmawiaj");
     }
     for (const door of this.data().doors) {
-      if (door.broken) continue;
+      if (door.broken || door.sealed || door.route) continue;
       const dist = Math.hypot(this.px - (door.x + 0.5) * TILE, this.py - (door.y + 0.5) * TILE);
       if (dist > 22) continue;
       if (door.locked && !this.hasKey) consider(dist, "E  zaryglowane");
@@ -2461,6 +4344,10 @@ export class Game {
     if (down && this.floorIndex > 0) {
       const dist = Math.hypot(this.px - (down.x + 0.5) * TILE, this.py - (down.y + 0.5) * TILE);
       if (dist < 18) consider(dist, "E  zejdź");
+    }
+    if (!label) {
+      const deviceHint = this.tacticalHint();
+      if (deviceHint) return deviceHint;
     }
     return label;
   }
@@ -2494,6 +4381,23 @@ export class Game {
         ? Math.round(Math.hypot(escortCiv.x - (goalTile.x + 0.5) * TILE, escortCiv.y - (goalTile.y + 0.5) * TILE) / TILE)
         : -1;
     const boss = this.floor.zombies.find((z) => z.kind === "boss");
+    const rawEnv = this.building.elevatorRide || this.building.passage ? null : this.environment?.hint() ?? null;
+    const environment = this.verticalWork
+      ? { label: this.verticalWork.label, hold: true, progress: this.verticalWork.progress, active: this.verticalWork.active }
+      : rawEnv;
+    const activeChoice = this.verticalChoice
+      ? {
+          speaker: this.verticalChoice.label,
+          text: this.verticalChoice.text,
+          options: this.verticalChoice.labels.map((label) => ({ label, enabled: true })),
+        }
+      : dir?.choice
+        ? {
+            speaker: dir.choice.speaker,
+            text: dir.choice.text,
+            options: dir.choice.options.map((o) => ({ label: o.label, enabled: o.enabled })),
+          }
+        : null;
     const hud: HudState = {
       hp: Math.ceil(this.hp),
       maxHp: this.maxHp,
@@ -2514,8 +4418,11 @@ export class Game {
       kills: this.kills,
       time: this.time,
       objective: this.objective(),
+      quest: this.questInfo(),
+      journal: [...this.building.journal],
       message: this.messageT > 0 ? this.message : "",
-      prompt: this.prompt(),
+      prompt: this.prompt(environment ?? undefined),
+      environment,
       hurt: this.hurt,
       lowHp: this.hp < 32,
       reloading: this.reloadT > 0 ? 1 - this.reloadT / this.reloadMax : 0,
@@ -2523,7 +4430,11 @@ export class Game {
       banner: this.bannerT > 0 ? this.data().name : "",
       bannerSub: this.bannerT > 0 ? this.data().sub : "",
       seed: this.seed,
-      noise: this.noise,
+      noise: this.tactical?.state.playerNoise ? this.tactical.state.playerNoise / 100 : 0,
+      noiseLevel: this.tactical?.state.playerNoise ?? 0,
+      noiseLabel: noiseLabel(this.tactical?.state.playerNoise ?? 0),
+      arousal: this.tactical?.state.arousal ?? 0,
+      grapple: this.grabbedBy !== null ? { count: this.grabStruggles, required: 5 } : null,
       zombiesLeft: aliveZ,
       bossHp: boss ? Math.max(0, Math.ceil(boss.hp)) : 0,
       bossMax: boss ? boss.maxHp : 0,
@@ -2534,13 +4445,7 @@ export class Game {
       alarm: !!dir?.alarm,
       escort: escortDist,
       event: dir?.banner ?? null,
-      choice: dir?.choice
-        ? {
-            speaker: dir.choice.speaker,
-            text: dir.choice.text,
-            options: dir.choice.options.map((o) => ({ label: o.label, enabled: o.enabled })),
-          }
-        : null,
+      choice: activeChoice,
       dialog: this.activeDialog
         ? {
             speaker: this.activeDialog.npc.name,
@@ -2571,6 +4476,65 @@ export class Game {
     ctx.fillStyle = theme === "roof" ? "#1a2844" : COL.void;
     ctx.fillRect(0, 0, this.viewW, this.viewH);
     if (!this.floor) return;
+    if (this.building.elevatorRide) {
+      drawLiftRideScene(
+        ctx,
+        this.viewW,
+        this.viewH,
+        this.building.elevatorRide,
+        this.building,
+        this.rig,
+        {
+          dir: this.dir,
+          aim: this.aim,
+          phase: this.animT,
+          moving: this.moving,
+          sprint: false,
+          t: this.time,
+          weapon: this.weapon,
+          recoil: 0,
+          reload: 0,
+          melee: -1,
+          flash: 0,
+          hurt: this.hurt,
+          pushing: false,
+        },
+        this.flashOn,
+        this.battery,
+        this.time,
+        this.shake,
+      );
+      return;
+    }
+    if (this.building.passage) {
+      drawPassageScene(
+        ctx,
+        this.viewW,
+        this.viewH,
+        this.building.passage,
+        this.rig,
+        {
+          dir: this.dir,
+          aim: this.aim,
+          phase: this.animT,
+          moving: this.moving,
+          sprint: false,
+          t: this.time,
+          weapon: this.weapon,
+          recoil: 0,
+          reload: 0,
+          melee: -1,
+          flash: 0,
+          hurt: this.hurt,
+          pushing: !!this.verticalWork?.active,
+        },
+        this.flashOn,
+        this.battery,
+        this.time,
+      );
+      drawPassageMinimap(ctx, this.viewW, this.viewH, this.building.passage);
+      return;
+    }
     const camX = Math.round(this.camX + (Math.random() - 0.5) * this.shake);
     const camY = Math.round(this.camY + (Math.random() - 0.5) * this.shake);
     const x0 = Math.floor(camX / TILE) - 1;
@@ -2578,6 +4542,12 @@ export class Game {
     const x1 = Math.ceil((camX + this.viewW) / TILE) + 1;
     const y1 = Math.ceil((camY + this.viewH) / TILE) + 1;
     const d = this.data();
+    const env = this.environment;
+    const frame = {
+      ctx, floor: d, x: camX, y: camY, w: this.viewW, h: this.viewH,
+      seen: (p: { x: number; y: number }) => this.inb(p.x, p.y) && !!this.floor?.explored[this.idx(p.x, p.y)],
+      visible: (p: { x: number; y: number }) => this.inb(p.x, p.y) && this.vis[this.idx(p.x, p.y)] === 1,
+    };
 
     // 1. Tiles + Wall Ambient Occlusion shadows
     for (let ty = y0; ty <= y1; ty++) {
@@ -2598,7 +4568,7 @@ export class Game {
         }
         const variant = Math.floor(Math.abs(Math.sin(tx * 12.9898 + ty * 78.233)) * 12);
         let spr: HTMLCanvasElement | null = null;
-        if (t === 1) {
+        if (t === Tile.Floor || t === Tile.Hole) {
           const fs = d.floorStyle?.[i] ?? 0;
           const bank = this.art.floorStyles[fs] ?? this.art.floors[d.theme];
           spr = bank[variant % bank.length];
@@ -2660,7 +4630,7 @@ export class Game {
 
     // 2. Floor carpets (non-solid props under entities)
     for (const p of d.props) {
-      if (p.solid) continue;
+      if (p.solid || isTacticalProp(p)) continue;
       const i = this.idx(p.x, p.y);
       if (!this.floor.explored[i] && theme !== "roof") continue;
       ctx.drawImage(this.art.props[p.kind], p.x * TILE - camX, p.y * TILE - camY);
@@ -2789,12 +4759,15 @@ export class Game {
       ctx.fillRect(sx, sy, 2, 1);
     }
 
+    if (env) drawEnvironmentGround(frame, env);
+    drawVerticalWorld(ctx, d, this.building, this.questState(), camX, camY, this.time, this.floor.explored);
+    if (this.tactical) drawTacticalProps(ctx, d, this.tactical.state, camX, camY, this.time, this.floor.explored);
     this.director?.drawProps(ctx, camX, camY, this.time);
 
     // 4. Y-sorted props, zombies & player
-    const draws: { y: number; draw: () => void }[] = [];
+    const draws: { y: number; draw: () => void }[] = env ? environmentProps(frame, env) : [];
     for (const p of d.props) {
-      if (!p.solid) continue;
+      if (!p.solid || isTacticalProp(p)) continue;
       const i = this.idx(p.x, p.y);
       if (!this.floor.explored[i] && !this.vis[i] && theme !== "roof") continue;
       draws.push({
@@ -2869,7 +4842,7 @@ export class Game {
         draw: () => this.drawZombie(ctx, z, camX, camY),
       });
     }
-    if (!(this.invuln > 0 && Math.floor(this.time * 16) % 2 === 0)) {
+    if (this.environmentHit || !(this.invuln > 0 && Math.floor(this.time * 16) % 2 === 0)) {
       draws.push({ y: this.py + 4, draw: () => this.drawPlayer(ctx, camX, camY) });
     }
     draws.sort((a, b) => a.y - b.y);
@@ -2889,6 +4862,7 @@ export class Game {
 
     // 6. POST-LIGHTING EMISSIVE / GLOW LAYER (zombie red eyes, tracers, sparks, fixtures, dust)
     this.drawPostLighting(ctx, camX, camY);
+    if (env) drawEnvironmentSignals(frame, env);
 
     // Lądowisko na dachu
     if (theme === "roof" && d.flare) {
@@ -2912,7 +4886,7 @@ export class Game {
       ctx.fillRect(0, 0, this.viewW, this.viewH);
     }
     if (this.hurt > 0) {
-      ctx.fillStyle = `rgba(140,16,16,${this.hurt * 0.28})`;
+      ctx.fillStyle = `rgba(140,16,16,${this.hurt * (this.environmentHit ? 0.12 : 0.28)})`;
       ctx.fillRect(0, 0, this.viewW, this.viewH);
     }
     this.director?.drawOverlay(ctx, this.viewW, this.viewH, this.time);
@@ -2975,37 +4949,9 @@ export class Game {
     const psx = this.px - camX;
     const psy = this.py - camY;
 
-    // Soft personal aura around player so the survivor is always crisp
-    addRadial(psx, psy, 34, "rgba(185,172,145,0.58)", "rgba(110,104,92,0.22)");
-
-    // RAYCASTED FLASHLIGHT CONE (blocked by walls & closed doors!)
-    if (this.flashOn && this.battery > 0) {
-      const lowFlicker =
-        this.battery < 18 && Math.sin(this.time * 26) * Math.sin(this.time * 11) > 0.55 ? 0.32 : 1.0;
-      const maxLen = 176;
-      const halfAngle = 0.56;
-      const rays = 40;
-      lc.save();
-      lc.beginPath();
-      lc.moveTo(psx, psy);
-      for (let i = 0; i <= rays; i++) {
-        const a = this.aim - halfAngle + (i / rays) * halfAngle * 2;
-        const hit = this.castRay(this.px, this.py, a, maxLen);
-        lc.lineTo(hit.x - camX, hit.y - camY);
-      }
-      lc.closePath();
-      const fg = lc.createRadialGradient(psx, psy, 4, psx, psy, maxLen);
-      fg.addColorStop(0, `rgba(255,247,206,${0.97 * lowFlicker})`);
-      fg.addColorStop(0.34, `rgba(240,230,152,${0.7 * lowFlicker})`);
-      fg.addColorStop(0.72, `rgba(186,182,124,${0.34 * lowFlicker})`);
-      fg.addColorStop(1, "rgba(0,0,0,0)");
-      lc.fillStyle = fg;
-      lc.fill();
-      lc.restore();
-    }
-
     // Ceiling & emergency light fixtures
     for (const lf of d.lights) {
+      if (this.environment?.roomDark(lf.roomId) || this.environment?.roomHidden(lf.roomId)) continue;
       const tx = Math.floor(lf.x / TILE);
       const ty = Math.floor(lf.y / TILE);
       if (this.inb(tx, ty) && !this.floor.explored[this.idx(tx, ty)] && d.theme !== "roof") continue;
@@ -3105,6 +5051,38 @@ export class Game {
           addRadial((fx + 0.5) * TILE - camX, (fy + 0.5) * TILE - camY, 30, spill[1], "rgba(0,0,0,0)");
         }
       }
+    }
+
+    // Reduce spill from adjoining rooms before applying the player's own light.
+    if (this.environment) for (const room of d.rooms) {
+      if (!this.environment.roomDark(room.id)) continue;
+      lc.globalCompositeOperation = "source-over";
+      lc.fillStyle = "#171c238e";
+      lc.fillRect(room.x * TILE - camX, room.y * TILE - camY, room.w * TILE, room.h * TILE);
+    }
+    lc.globalCompositeOperation = "lighter";
+    addRadial(psx, psy, 34, "rgba(185,172,145,0.58)", "rgba(110,104,92,0.22)");
+
+    if (this.flashOn && this.battery > 0) {
+      const lowFlicker = this.battery < 18 && Math.sin(this.time * 26) * Math.sin(this.time * 11) > 0.55 ? 0.32 : 1.0;
+      const maxLen = 176, halfAngle = 0.56, rays = 40;
+      lc.save();
+      lc.beginPath();
+      lc.moveTo(psx, psy);
+      for (let i = 0; i <= rays; i++) {
+        const a = this.aim - halfAngle + (i / rays) * halfAngle * 2;
+        const hit = this.castRay(this.px, this.py, a, maxLen);
+        lc.lineTo(hit.x - camX, hit.y - camY);
+      }
+      lc.closePath();
+      const fg = lc.createRadialGradient(psx, psy, 4, psx, psy, maxLen);
+      fg.addColorStop(0, `rgba(255,247,206,${0.97 * lowFlicker})`);
+      fg.addColorStop(0.34, `rgba(240,230,152,${0.7 * lowFlicker})`);
+      fg.addColorStop(0.72, `rgba(186,182,124,${0.34 * lowFlicker})`);
+      fg.addColorStop(1, "rgba(0,0,0,0)");
+      lc.fillStyle = fg;
+      lc.fill();
+      lc.restore();
     }
 
     // Dynamic muzzle flash light illuminating the whole room briefly!
@@ -3689,7 +5667,16 @@ export class Game {
       melee: this.meleeT > 0 ? 1 - this.meleeT / this.meleeDur : -1,
       flash: this.flashT,
       hurt: this.hurt,
+      pushing: !!this.environment?.working,
     };
+    if (this.grabbedBy !== null) {
+      ctx.save();
+      ctx.translate(Math.round(x), Math.round(y) + 7);
+      ctx.rotate(Math.PI * 0.42);
+      this.rig.draw(ctx, 0, -7, st);
+      ctx.restore();
+      return;
+    }
     if (this.dead) {
       ctx.save();
       ctx.translate(Math.round(x), Math.round(y) + 8);
@@ -3702,6 +5689,24 @@ export class Game {
   }
 
   private drawZombie(ctx: CanvasRenderingContext2D, z: Zombie, camX: number, camY: number) {
+    if (z.kind === "crawler") {
+      drawCrawler(ctx, Math.round(z.x - camX), Math.round(z.y - camY), z.animT, z.state === "dead", z.downT, z.hurtFlash > 0, z.dir === "left");
+      return;
+    }
+    if (z.downT > 0 && z.state !== "dead") {
+      const sx = Math.round(z.x - camX), sy = Math.round(z.y - camY);
+      const spr = this.art.zombie[z.kind][z.dir][Math.floor(z.animT * 5) % 4];
+      ctx.save();
+      ctx.translate(sx, sy + 7);
+      ctx.rotate((z.dir === "left" ? -1 : 1) * Math.PI / 2 * Math.min(1, z.downT / 0.5));
+      ctx.drawImage(spr, -spr.width / 2, -spr.height + 5);
+      ctx.restore();
+      if (z.hp < z.maxHp) {
+        ctx.fillStyle = COL.ink; ctx.fillRect(sx - 7, sy - 7, 14, 2);
+        ctx.fillStyle = COL.bloodBright; ctx.fillRect(sx - 7, sy - 7, Math.max(1, Math.round(14 * z.hp / z.maxHp)), 2);
+      }
+      return;
+    }
     const sc = z.kind === "boss" ? 2 : 1;
     const falling = z.state === "dead" && z.deadT < 0.32;
     const spr =
@@ -4001,11 +6006,12 @@ export class Game {
         let col = this.vis[i] ? floorColors[style] ?? "#7b877e" : rememberedColors[style] ?? "#53605e";
         if (t === 0) col = "#303b3e";
         else if (t === 6) col = "#57707a";
-        else if (t === 2) col = "#c3985a";
+        else if (t === 2) col = this.doorAt(x, y)?.sealed ? "#49413b" : "#c3985a";
         else if (t === 3) col = "#9a8666";
         else if (t === 9) col = "#131b24";
         else if (t === 8) col = "#50748a";
         else if (t === 7) col = "#776b5a";
+        else if (t === Tile.Hole) col = "#2a211e";
         ctx.fillStyle = col;
         ctx.fillRect(ox + x * ms, oy + y * ms, ms, ms);
       }
@@ -4030,10 +6036,26 @@ export class Game {
       if (!p.opened && p.loot && p.id !== d.keyPropId) marker(tx, ty, "#a1bf89", 1);
     }
     if (d.stairsDown && this.floor.explored[this.idx(d.stairsDown.x, d.stairsDown.y)]) marker(d.stairsDown.x, d.stairsDown.y, "#92aeb4", 2);
+    for (const { at, color } of this.environment?.markers() ?? []) {
+      if (this.floor.explored[this.idx(at.x, at.y)]) marker(at.x, at.y, color, 1);
+    }
+    const v = d.vertical;
+    if (v?.elevator && this.floor.explored[this.idx(v.elevator.outside.x, v.elevator.outside.y)]) {
+      marker(v.elevator.door.x, v.elevator.door.y, this.building.elevatorBroken ? "#d96858" : this.building.elevatorPowered ? "#7ad49b" : "#9ba7ad", 2);
+    }
+    if (v?.service && this.floor.explored[this.idx(v.service.outside.x, v.service.outside.y)]) {
+      marker(v.service.door.x, v.service.door.y, "#78c7b7", 2);
+    }
+    if (v?.stairsB && this.floor.explored[this.idx(v.stairsB.outside.x, v.stairsB.outside.y)]) {
+      marker(v.stairsB.door.x, v.stairsB.door.y, "#92aeb4", 2);
+    }
     const goal = this.goalTile();
     if (goal) marker(goal.x, goal.y, "#f2c77e", 3);
     if (dir?.camp) marker(Math.floor(dir.camp.x / TILE), Math.floor(dir.camp.y / TILE), "#e8874a", 2);
     if (dir?.alarm) marker(Math.floor(dir.alarm.x / TILE), Math.floor(dir.alarm.y / TILE), "#e56858", 2);
+    for (const site of dir?.sites() ?? []) {
+      marker(site.x, site.y, site.kind === "cache" ? "#a1bf89" : site.kind === "radio" ? "#78c7b7" : "#e8874a", 2);
+    }
     for (const civ of dir?.civilians() ?? []) {
       if (civ.state === "dead" || civ.state === "gone") continue;
       const tx = Math.floor(civ.x / TILE), ty = Math.floor(civ.y / TILE);

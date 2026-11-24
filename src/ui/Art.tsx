@@ -33,7 +33,7 @@ const paths = {
 } as const;
 
 export function Icon({ name, size = 18, className = "" }: { name: keyof typeof paths | "play"; size?: number; className?: string }) {
-  return <svg className={`ui-icon ${className}`} width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="1.65" strokeLinejoin="miter" strokeLinecap="square">
+  return <svg className={`ui-icon ${className}`} width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" strokeWidth="2" strokeLinejoin="miter" strokeLinecap="square" shapeRendering="crispEdges">
     {name === "play" ? <path d="M5 3h3v2h3v2h3v2h3v2h3v2h-3v2h-3v2h-3v2H8v2H5z" stroke="none" fill="currentColor" /> : <path d={paths[name]} />}
   </svg>;
 }
@@ -64,35 +64,142 @@ export function Wordmark() {
   </svg>;
 }
 
+/* =======================================================================
+   Weapon icons are real pixel rasters: a 40 x 18 grid of hard-edged blocks,
+   drawn at 2x. No curves, no anti-aliased diagonals, no gradients.
+   ======================================================================= */
+
+type Block = [x: number, y: number, w: number, h: number, color: string];
+
+const PIXEL_COLORS: Record<string, string> = {
+  " ": "transparent",
+  "0": "#0b1114", // ink outline
+  "1": "#27343a", // dark steel
+  "2": "#617078", // steel
+  "3": "#aeb9b2", // steel highlight
+  "4": "#e3e7d8", // glint
+  "5": "#4e3525", // dark wood
+  "6": "#8d6540", // wood
+  "7": "#c39a65", // wood highlight
+  "8": "#833a2c", // dark rust
+  "9": "#bf5937", // rust
+  a: "#e08a55", // rust highlight
+  b: "#332723", // dark grip
+  c: "#6b5036", // grip
+  d: "#d8b25f", // brass
+  f: "#3d4c55", // blued steel
+  g: "#c9ccae", // cord / bone
+  h: "#181d1f", // shadow
+};
+
+const GRID_W = 40;
+const GRID_H = 18;
+const SCALE = 2;
+
+function diagonal(steps: number, x0: number, y0: number, dx: number, dy: number, paint: (x: number, y: number, i: number) => void) {
+  for (let i = 0; i < steps; i++) paint(x0 + i * dx, y0 + i * dy, i);
+}
+
+function buildWeapons(): Record<WeaponId, Block[]> {
+  const crowbar: Block[] = [];
+  diagonal(13, 3, 14, 2, -1, (x, y) => crowbar.push([x, y, 6, 3, "0"]));
+  diagonal(13, 4, 15, 2, -1, (x, y) => crowbar.push([x, y, 4, 1, "8"]));
+  diagonal(13, 5, 15, 2, -1, (x, y) => crowbar.push([x, y, 3, 1, "9"]));
+  diagonal(13, 5, 15, 2, -1, (x, y) => crowbar.push([x, y, 1, 1, "a"]));
+  crowbar.push(
+    [27, 2, 10, 4, "0"], [28, 3, 8, 2, "3"], [35, 3, 3, 5, "0"], [36, 4, 2, 3, "4"],
+    [31, 1, 5, 2, "0"], [32, 2, 3, 1, "3"],
+    [2, 13, 6, 5, "0"], [3, 14, 4, 3, "b"], [3, 14, 2, 1, "c"], [3, 17, 4, 1, "1"],
+  );
+
+  const hatchet: Block[] = [];
+  diagonal(11, 2, 14, 2, -1, (x, y) => hatchet.push([x, y, 5, 3, "0"]));
+  diagonal(11, 3, 15, 2, -1, (x, y) => hatchet.push([x, y, 3, 1, "6"]));
+  diagonal(11, 3, 15, 2, -1, (x, y) => hatchet.push([x, y, 1, 1, "7"]));
+  hatchet.push(
+    [24, 5, 5, 6, "1"], [25, 6, 3, 4, "2"],
+    [27, 1, 12, 9, "0"], [28, 2, 10, 7, "2"], [34, 5, 5, 5, " "],
+    [28, 2, 9, 1, "3"], [29, 3, 7, 1, "3"], [28, 4, 5, 2, "3"], [29, 4, 2, 1, "4"],
+    [36, 2, 2, 3, "4"], [27, 1, 3, 2, "1"],
+    [2, 13, 6, 5, "0"], [3, 14, 4, 3, "5"], [3, 14, 2, 1, "6"],
+  );
+
+  const pistol: Block[] = [
+    [4, 4, 32, 5, "0"], [5, 5, 30, 3, "1"], [5, 5, 30, 1, "3"], [5, 7, 30, 1, "2"],
+    [33, 5, 3, 2, "4"], [6, 8, 26, 1, "f"],
+    [7, 9, 9, 8, "0"], [8, 10, 7, 6, "b"], [9, 10, 5, 1, "c"],
+    [9, 12, 3, 1, "c"], [9, 14, 3, 1, "c"], [8, 16, 7, 1, "1"],
+    [16, 9, 8, 3, "0"], [17, 10, 6, 1, " "], [18, 8, 2, 3, "2"], [19, 9, 1, 1, "4"],
+    [24, 8, 7, 2, "1"], [25, 8, 5, 1, "2"], [5, 4, 3, 2, "1"],
+    [12, 5, 2, 1, "4"], [16, 5, 2, 1, "4"],
+  ];
+
+  const revolver: Block[] = [
+    [6, 4, 32, 4, "0"], [7, 5, 30, 2, "1"], [7, 5, 30, 1, "3"], [35, 5, 2, 1, "4"],
+    [12, 7, 12, 5, "0"], [13, 8, 10, 3, "2"], [14, 8, 2, 3, "1"], [18, 8, 2, 3, "1"],
+    [16, 6, 6, 1, "f"], [7, 9, 10, 8, "0"], [8, 10, 8, 6, "5"], [9, 10, 6, 1, "6"],
+    [9, 12, 4, 1, "c"], [9, 14, 4, 1, "c"], [8, 16, 8, 1, "1"],
+    [23, 8, 8, 3, "0"], [24, 9, 6, 1, " "], [20, 7, 2, 3, "2"], [27, 4, 7, 1, "d"],
+  ];
+
+  const shotgun: Block[] = [
+    [2, 8, 13, 6, "0"], [3, 9, 11, 4, "5"], [3, 9, 11, 1, "6"], [4, 11, 8, 1, "7"],
+    [2, 12, 5, 3, "0"], [3, 13, 3, 1, "5"],
+    [13, 6, 26, 6, "0"], [14, 7, 24, 2, "1"], [14, 7, 24, 1, "3"],
+    [14, 9, 24, 2, "2"], [14, 10, 24, 1, "1"], [36, 6, 2, 1, "4"], [36, 9, 2, 1, "4"],
+    [13, 11, 10, 2, "0"], [14, 11, 8, 1, "f"],
+    [21, 11, 9, 3, "0"], [22, 12, 7, 1, "6"], [22, 13, 7, 1, "5"],
+    [13, 6, 3, 6, "b"], [14, 7, 1, 4, "2"], [30, 11, 2, 2, "d"],
+  ];
+
+  const crossbow: Block[] = [
+    [2, 8, 34, 3, "0"], [3, 9, 32, 1, "6"], [3, 9, 22, 1, "7"], [3, 10, 32, 1, "5"],
+    [2, 11, 6, 3, "0"], [3, 12, 4, 1, "5"],
+    [28, 2, 4, 14, "0"], [29, 3, 2, 12, "2"], [30, 3, 1, 12, "3"],
+    [26, 3, 2, 3, "0"], [26, 14, 2, 3, "0"], [34, 3, 2, 3, "0"], [34, 14, 2, 3, "0"],
+    [7, 7, 24, 1, "g"], [6, 6, 3, 3, "0"], [7, 7, 1, 1, "4"], [30, 7, 4, 1, "2"],
+    [10, 5, 3, 3, "0"], [11, 6, 1, 1, "4"], [16, 11, 10, 2, "0"], [17, 11, 8, 1, "b"],
+    [35, 8, 3, 2, "d"],
+  ];
+  diagonal(11, 28, 3, -1, 1, (x, y) => crossbow.push([x, y, 1, 1, "g"]));
+  diagonal(11, 28, 15, -1, -1, (x, y) => crossbow.push([x, y, 1, 1, "g"]));
+
+  const machete: Block[] = [
+    [2, 12, 10, 4, "0"], [3, 13, 8, 2, "b"], [4, 13, 5, 1, "c"],
+    [10, 10, 3, 6, "0"], [11, 11, 2, 4, "d"],
+    [12, 5, 20, 5, "0"], [13, 6, 18, 3, "2"], [14, 6, 16, 1, "4"],
+    [30, 4, 6, 6, "0"], [31, 5, 4, 3, "3"], [34, 7, 3, 4, "0"],
+    [14, 8, 17, 1, "3"], [13, 9, 3, 2, "1"],
+  ];
+
+  return { crowbar, pistol, hatchet, revolver, shotgun, crossbow, machete };
+}
+
+const WEAPON_BLOCKS = buildWeapons();
+
+function PixelWeapon({ blocks }: { blocks: Block[] }) {
+  const grid: string[][] = Array.from({ length: GRID_H }, () => Array<string>(GRID_W).fill(" "));
+  for (const [x, y, w, h, color] of blocks) {
+    for (let py = Math.max(0, y); py < Math.min(GRID_H, y + h); py++) {
+      for (let px = Math.max(0, x); px < Math.min(GRID_W, x + w); px++) grid[py][px] = color;
+    }
+  }
+  const rects: ReactNode[] = [];
+  for (let y = 0; y < GRID_H; y++) {
+    let x = 0;
+    while (x < GRID_W) {
+      const color = grid[y][x];
+      let run = 1;
+      while (x + run < GRID_W && grid[y][x + run] === color) run++;
+      if (color !== " ") rects.push(<rect key={`${x}-${y}`} x={x * SCALE} y={y * SCALE} width={run * SCALE} height={SCALE} fill={PIXEL_COLORS[color]} />);
+      x += run;
+    }
+  }
+  return <g shapeRendering="crispEdges">{rects}</g>;
+}
+
 export function WeaponArt({ id, className = "" }: { id: WeaponId; className?: string }) {
-  const arts: Record<WeaponId, ReactNode> = {
-    crowbar: <g>
-      <path fill="#28201e" d="M5 28h6v-3h8v-3h8v-3h8v-3h8v-3h8v-3h8V7h8V5h8v2h3v8h-3v4h-6v-3h-2v-4h-6v3h-8v3h-8v3h-8v3h-8v3h-8v3h-8v3H5z" />
-      <path fill="#a2573c" d="M7 28h6v-3h8v-3h8v-3h8v-3h8v-3h8v-3h9V8h6v3h-6v3h-8v3h-8v3h-8v3h-8v3h-8v3h-8v3H7z" />
-      <path fill="#ce8a5d" d="M13 25h8v1h-8zm16-6h8v1h-8zm16-6h8v1h-8zm18-6h9v2h-9z" />
-      <path fill="#939e9e" d="M5 29h8v2H9v2H5zM67 6h7v2h3v7h-3v2h-4v-3h3v-4h-6z" /><path fill="#d4d7c9" d="M68 6h6v2h-6zm5 8h3v2h-3z" />
-    </g>,
-    pistol: <g>
-      <path fill="#161b1e" d="M13 7h5V4h4v3h38V4h4v3h4v9H54v6H39l-3 10H20v-5h3v-5h2v-6H13z" />
-      <path fill="#909a9a" d="M14 8h52v5H14z" /><path fill="#c7cdc4" d="M18 7h47v2H18zM60 5h3v2h-3z" />
-      <path fill="#5e6b71" d="M15 11h50v3H15z" /><path fill="#333e44" d="M15 14h43v3H34l-4 13h-9l6-16z" />
-      <path fill="#57564d" d="M27 17h9v4h-2v5h-2v5H22v-3h2v-6h3z" />
-      <path fill="#323637" d="M26 22h8v2h-8zm-2 5h8v2h-8zM19 7h2v5h-2zm4 0h2v5h-2zm4 0h2v5h-2z" />
-      <path fill="#7a8687" d="M37 16h2v5h10v-5h3v7H36z" /><path fill="#aeb5aa" d="M41 16h3v4h-2z" />
-    </g>,
-    hatchet: <g><path fill="#543a27" d="M16 29 51 4l5 6-35 25z"/><path fill="#b48c61" d="m17 29 34-24 2 3-34 24z"/>
-      <path fill="#818e91" d="m43 8 9-7 6 5 9 1 4 5-4 7-7 4-4-6-8-4z"/><path fill="#c6cec6" d="m69 9 2 3-4 7-7 4-2-3 6-4z"/><path fill="#4b585b" d="m44 8 7-5 6 6-6 5z"/>
-    </g>,
-    revolver: <g><path fill="#829092" d="M12 9h27V7h29v6H43v6H25l-6 12H9l5-14H9V9z"/><path fill="#c4cbc1" d="M39 7h27v2H39zm23-2h4v2h-4z"/>
-      <path fill="#51595b" d="M24 9h16v10H24zM40 11h27v3H40z"/><path fill="#b0b9b6" d="M26 9h12v2H26zm0 5h12v2H26z"/><path fill="#936c4c" d="M16 17h10v4h-3v5h-3v6H8v-5h4v-6h4z"/><path fill="#686e6b" d="M27 18h2v5h9v-5h2v7H26z"/>
-    </g>,
-    shotgun: <g><path fill="#674933" d="m2 23 19-9h10v8H19L4 31H2z"/><path fill="#ac8358" d="m3 23 17-8h8v3H18L3 27z"/>
-      <path fill="#57646a" d="M23 12h53v5H41v3H23z"/><path fill="#a5b2b0" d="M29 10h47v3H29z"/><path fill="#c8d0c3" d="M35 10h40v1H35z"/>
-      <path fill="#967047" d="M39 16h20v5H39z"/><path fill="#413a30" d="M42 16h2v4h-2zm5 0h2v4h-2zm5 0h2v4h-2zM24 20h2v4h8v-4h2v6H24z"/>
-    </g>,
-    crossbow: <g><path fill="#8d6c46" d="m7 25 47-13 3 5-47 15z"/><path fill="#c2a073" d="m14 24 40-12 1 2-40 12z"/>
-      <path fill="#8d9c9a" d="m41 2 8 2 8 8 7 12 1 10-4-3-1-8-7-10-8-8z"/><path fill="none" stroke="#b8b5a1" strokeWidth="1" d="m43 3-13 17 33 13"/><path fill="#343e3e" d="m30 16 26-7 1 3-26 7z"/><path fill="#c3ceca" d="m31 17 32-9-3 4z"/>
-    </g>,
-  };
-  return <svg className={`weapon-sprite ${className}`} viewBox="0 0 80 36" aria-hidden="true" shapeRendering="crispEdges">{arts[id]}</svg>;
+  return <svg className={`weapon-sprite ${className}`} viewBox={`0 0 ${GRID_W * SCALE} ${GRID_H * SCALE}`} aria-hidden="true" shapeRendering="crispEdges" style={{ imageRendering: "pixelated" }}>
+    <PixelWeapon blocks={WEAPON_BLOCKS[id]} />
+  </svg>;
 }

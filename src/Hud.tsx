@@ -18,12 +18,13 @@ function fmt(t: number) {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
 }
 
-export function Hud({ hud, onInventory, onSlot, onPause, onInteract, onChoose, onHint, hintLock }: {
+export function Hud({ hud, onInventory, onJournal, onSlot, onPause, onInteract, onHold, onChoose, onHint, hintLock }: {
   hud: HudState; onInventory: () => void; onSlot: (slot: number) => void; onPause: () => void;
-  onInteract: () => void; onChoose: (index: number) => void; onHint: (a: string) => void; hintLock: boolean;
+  onJournal: () => void; onInteract: () => void; onHold: (active: boolean) => void; onChoose: (index: number) => void; onHint: (a: string) => void; hintLock: boolean;
 }) {
   const spec = WEAPONS[hud.weapon];
   const ask = hud.prompt.match(/^(\S+)\s+(.*)$/);
+  const work = hud.environment?.hold && hud.environment;
   const hpFrac = hud.hp / hud.maxHp;
   return (
     <div className="hud">
@@ -56,15 +57,22 @@ export function Hud({ hud, onInventory, onSlot, onPause, onInteract, onChoose, o
           <span className="vital-row" title={`Bateria latarki ${Math.round(hud.battery * 100)}%`} aria-label={`Bateria latarki ${Math.round(hud.battery * 100)} procent`}>
             <Icon name="flashlight" size={13} /><span className={`mini-bar bt ${hud.flashOn ? "on" : ""}`}><i style={{ width: `${hud.battery * 100}%` }} /></span><em>{Math.round(hud.battery * 100)}</em>
           </span>
+          <div className={`noise-meter noise-${hud.noiseLabel.toLowerCase().replace(" ", "-")}`} aria-label={`Hałas ${Math.round(hud.noiseLevel)} na 100: ${hud.noiseLabel}`}>
+            <span className="noise-caption"><Icon name="sound" size={12} /><b>HAŁAS</b><em>{Math.round(hud.noiseLevel)}</em></span>
+            <span className="noise-track"><i style={{ width: `${Math.max(0, Math.min(100, hud.noiseLevel))}%` }} /></span>
+            <small>{hud.noiseLabel}</small>
+          </div>
         </div>
         <div className="mini-goal">
           <span>{hud.objective}</span>
           <small>{hud.floorName}{hud.zoneName ? ` · ${hud.zoneName}` : ""}</small>
+          {hud.quest && <em className="quest-step">{hud.quest.step}</em>}
         </div>
         <div className="mini-status">
           {hud.hasKey && <Icon name="keyIcon" size={13} className="has-key" />}
           <span className="mini-time">{fmt(hud.time)}</span>
           <span className="mini-zombies" title="Zombie na piętrze"><Icon name="skull" size={12} />{hud.zombiesLeft}{hud.extraZombies > 0 && <b>+{hud.extraZombies}</b>}</span>
+          <button className="hud-pause" onClick={onJournal} aria-label="Dziennik (J)" title="Dziennik (J)"><Icon name="book" size={13} /></button>
           <button className="hud-pause" onClick={onPause} aria-label="Wstrzymaj grę"><Icon name="pause" size={14} /></button>
         </div>
       </div>
@@ -77,6 +85,12 @@ export function Hud({ hud, onInventory, onSlot, onPause, onInteract, onChoose, o
           {hud.escort >= 0 && <span className="state good">OCALAŁY → KLATKA {hud.escort} m</span>}
         </div>
       )}
+
+      {hud.grapple && <section className="grapple-panel" aria-live="assertive">
+        <strong>ODPCHNIJ ZOMBIE — E: {hud.grapple.count}/{hud.grapple.required}</strong>
+        <span>Każde osobne naciśnięcie E szarpie przeciwnikiem.</span>
+        <div className="grapple-track"><i style={{ width: `${hud.grapple.count / hud.grapple.required * 100}%` }} /></div>
+      </section>}
 
       {hud.event && (
         <div className={`event-toast ${hud.event.tone}`} key={hud.event.title + hud.event.text}>
@@ -153,13 +167,27 @@ export function Hud({ hud, onInventory, onSlot, onPause, onInteract, onChoose, o
               <Bar value={hud.flare} segs={16} cls="rs" />
             </section>
           )}
-          {!hud.dialog && !hud.choice && ask && (
+          {!hud.dialog && !hud.choice && ask && work && (
+            <section className={`work-meter ${work.active ? "working" : ""}`} aria-label="Przesuwanie przeszkody">
+              <button className="ask work-ask" onPointerDown={(e) => {
+                if (e.button !== 0) return;
+                e.currentTarget.setPointerCapture(e.pointerId);
+                onHold(true);
+              }} onPointerUp={() => onHold(false)} onPointerCancel={() => onHold(false)} onLostPointerCapture={() => onHold(false)}>
+                <kbd>E</kbd> Przytrzymaj: {work.label}
+              </button>
+              <div role="progressbar" aria-label="Postęp przesuwania" aria-valuenow={Math.floor(work.progress * 100)}>
+                <Bar value={work.progress} segs={12} cls="work" />
+              </div>
+            </section>
+          )}
+          {!hud.dialog && !hud.choice && ask && !work && (
             <button className="ask" onClick={onInteract}>
               <kbd className="k">{ask[1]}</kbd>
               {ask[2]}
             </button>
           )}
-          {!hud.choice && !hud.dialog && hud.message && <div className={`say ${hud.message.startsWith("WASD:") ? "keyboard-summary" : ""}`}>{hud.message}</div>}
+          {!hud.choice && !hud.dialog && hud.message && !(work && hud.message.startsWith("WASD:")) && <div className={`say ${hud.message.startsWith("WASD:") ? "keyboard-summary" : ""}`}>{hud.message}</div>}
         </div>
         <div />
       </div>

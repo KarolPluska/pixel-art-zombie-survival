@@ -4,7 +4,9 @@ import type { Art } from "./sprites";
 import type { DoorInfo, FloorData, Prop, ZombieKind } from "./types";
 
 export type Tone = "info" | "good" | "warn" | "danger";
-export type EventKind = "runners" | "camp" | "escort" | "knock" | "blackout" | "alarm" | "barricade";
+export type EventKind =
+  | "runners" | "camp" | "escort" | "knock" | "blackout" | "alarm" | "barricade"
+  | "cache" | "radio" | "intercom" | "ambush" | "aid";
 export type Resource = "ammo" | "shells" | "bolts" | "battery";
 
 export interface EventSounds {
@@ -115,6 +117,7 @@ interface LiveEvent {
   hp?: number;
   stage?: number;
   beep?: number;
+  loot?: Resource;
 }
 
 const CIV_NAMES = ["MAREK", "HALINA", "TOMEK", "ANKA", "DOZORCA", "WIKTOR", "ELA"];
@@ -134,6 +137,8 @@ export class EventDirector {
   private checkT = 0;
   private bangT = 0;
   private escortWarn = 0;
+  private npcKinds = new Set<EventKind>();
+  npcEncounterCount = 0;
 
   hidden = false;
   blackoutT = 0;
@@ -238,6 +243,23 @@ export class EventDirector {
     return null;
   }
 
+  /** Separate NPC schedule: never consumes the combat-event budget. */
+  requestNpc(preferred?: "escort" | "camp" | "runners" | "knock" | "aid", escortBusy = false): boolean {
+    if (this.w.floor().index >= 10 || this.hidden || this.choice || this.npcKinds.size >= 2 || this.floorAge < 6) return false;
+    const choices: EventKind[] = preferred ? [preferred] : escortBusy ? ["aid", "camp", "runners", "knock"] : ["escort", "aid", "camp", "runners", "knock"];
+    for (const extra of ["aid", "camp", "runners", "knock"] as const) if (!choices.includes(extra)) choices.push(extra);
+    for (const kind of choices) {
+      if (this.npcKinds.has(kind) || (kind === "escort" && (escortBusy || !this.w.floor().stairsUp))) continue;
+      if (this.start(kind)) {
+        this.npcKinds.add(kind);
+        return true;
+      }
+    }
+    return false;
+  }
+
+  get escortActive() { return this.escortId >= 0; }
+
   /* ---------------- director loop ---------------- */
 
   update(dt: number) {
@@ -272,9 +294,10 @@ export class EventDirector {
     const f = this.w.floor();
     if (f.index >= 10) return;
     if (this.choice || this.hidden) return;
-    if (this.cooldown > 0 || this.floorAge < 24) return;
-    if (this.events.length >= 2 || this.spawnedHere >= 2) return;
+    if (this.cooldown > 0 || this.floorAge < 22) return;
+    if (this.events.length >= 3 || this.spawnedHere >= 3) return;
     const options: { kind: EventKind; weight: number; ok: boolean }[] = [
+      { kind: "aid", weight: 14, ok: this.campRoom() !== null },
       { kind: "runners", weight: 16, ok: this.corridor().length > 0 },
       { kind: "camp", weight: 17, ok: this.campRoom() !== null },
       { kind: "escort", weight: 13, ok: !!f.stairsUp },
@@ -282,6 +305,10 @@ export class EventDirector {
       { kind: "blackout", weight: 13, ok: f.index > 0 },
       { kind: "alarm", weight: 11, ok: f.index > 1 },
       { kind: "barricade", weight: 12, ok: this.pressureDoor() !== null },
+      { kind: "cache", weight: 18, ok: true },
+      { kind: "radio", weight: 15, ok: f.index > 0 },
+      { kind: "intercom", weight: 14, ok: f.index > 0 },
+      { kind: "ambush", weight: 14, ok: f.index > 1 && this.reinforceLeft > 1 },
     ];
     const pool = options.filter((o) => o.ok && !this.usedKinds.has(o.kind));
     if (!pool.length) {
@@ -301,7 +328,7 @@ export class EventDirector {
     if (this.start(chosen)) {
       this.usedKinds.add(chosen);
       this.spawnedHere++;
-      this.cooldown = 52 + this.rand() * 40;
+      this.cooldown = 40 + this.rand() * 28;
     } else {
       this.cooldown = 18;
     }
@@ -309,7 +336,7 @@ export class EventDirector {
 
   private start(kind: EventKind): boolean {
     const ev: LiveEvent = { id: this.nextId++, kind, t: 0, civs: [], zombies: [] };
-    switch (kind) {
+    const started = (() => { switch (kind) {
       case "runners":
         return this.startRunners(ev);
       case "camp":
@@ -329,6 +356,68 @@ export class EventDirector {
         return this.startAlarm(ev);
       case "barricade":
         return this.startBarricade(ev);
+      case "cache":
+        return this.startCache(ev);
+      case "radio":
+        return this.startRadio(ev);
+      case "intercom":
+        return this.startIntercom(ev);
+      case "ambush":
+        return this.startAmbush(ev);
+      case "aid":
+        return this.startAid(ev);
+    } })();
+    if (started && ["runners", "camp", "escort", "knock", "aid"].includes(kind)) this.npcEncounterCount++;
+    return started;
+  }
+
+  private startAid(ev: LiveEvent) {
+    const room = this.campRoom();
+    if (!room) return false;
+    const x = (room.x + room.w / 2) * TILE, y = (room.y + room.h / 2) * TILE;
+    const civ = this.addCiv(x, y, "camp", ev.id, false);
+    ev.variant = this.pick(["friendly", "trade", "distrust"] as const);
+    civ.faction = "friendly";
+    civ.state = "sit";
+    civ.hp = ev.variant === "distrust" ? 34 : civ.hp;
+    ev.civs.push(civ.id);
+    this.tell(ev.variant === "distrust" ? "RANE / WOŁANIE" : "GŁOS Z MIESZKANIA", "Ktoś prosi o chwilę rozmowy. Możesz pomóc albo odejść.", "info");
+    this.events.push(ev);
+    return true;
+  }
+
+  private aidTalk(ev: LiveEvent) {
+    const civ = ev.civs.map((id) => this.civ(id)).find((c): c is Civ => !!c && c.state !== "dead" && c.state !== "gone");
+    if (!civ) return;
+    if (ev.resolved) {
+      this.openChoice(civ.name, "Dzięki. Zajmę się sobą. Idź ostrożnie.", [{ label: "Odejdź", enabled: true, run: () => this.closeChoice() }]);
+      return;
+    }
+    if (ev.variant === "trade") {
+      const can = this.w.count("ammo") >= 8;
+      this.openChoice(civ.name, "Zostaw mi osiem naboi. Oddam cztery ładunki śrutu.", [
+        { label: can ? "Przekaż 8 naboi (+4 śrut)" : "Brakuje 8 naboi", enabled: can, run: () => {
+          if (!this.w.take("ammo", 8)) return;
+          ev.resolved = true; this.w.give("shells", 4); civ.state = "leave"; civ.thanked = true; this.w.sound().thanks(); this.closeChoice();
+        } },
+        { label: "Odmów i odejdź", enabled: true, run: () => { ev.resolved = true; this.closeChoice(); } },
+      ]);
+    } else if (ev.variant === "distrust") {
+      const can = this.w.count("battery") >= 20;
+      this.openChoice(civ.name, "Jestem ranny. Potrzebuję światła, żeby dotrzeć do klatki. Podzielisz się baterią?", [
+        { label: can ? "Podaj 20% baterii (+10 naboi)" : "Nie masz 20% baterii", enabled: can, run: () => {
+          if (!this.w.take("battery", 20)) return;
+          ev.resolved = true; this.w.give("ammo", 10); civ.state = "leave"; civ.thanked = true; this.w.sound().thanks(); this.closeChoice();
+        } },
+        { label: "Nie teraz", enabled: true, run: () => { ev.resolved = true; this.closeChoice(); } },
+      ]);
+    } else {
+      this.openChoice(civ.name, "Znam obejście. Mogę pokazać ci drogę do klatki — chodź za mną albo weź zapasy.", [
+        { label: "Przyjmij zapasy i wskaż drogę", enabled: true, run: () => {
+          ev.resolved = true; this.w.give("ammo", 6); this.w.give("battery", 12); civ.state = "leave"; civ.thanked = true; this.w.sound().thanks(); this.closeChoice();
+        } },
+        { label: "Odejdź bez pomocy", enabled: true, run: () => { ev.resolved = true; this.closeChoice(); } },
+      ]);
     }
   }
 
@@ -527,7 +616,7 @@ export class EventDirector {
     const ptx = this.w.px() / TILE;
     const pty = this.w.py() / TILE;
     const near = f.doors.filter(
-      (d) => !d.open && !d.broken && !d.locked && Math.hypot(d.x - ptx, d.y - pty) > 3 && Math.hypot(d.x - ptx, d.y - pty) < 13,
+      (d) => !d.sealed && !d.route && !d.open && !d.broken && !d.locked && Math.hypot(d.x - ptx, d.y - pty) > 3 && Math.hypot(d.x - ptx, d.y - pty) < 13,
     );
     return near.length ? this.pick(near) : null;
   }
@@ -566,7 +655,7 @@ export class EventDirector {
     const f = this.w.floor();
     const ptx = this.w.px() / TILE;
     const pty = this.w.py() / TILE;
-    const near = f.doors.filter((d) => !d.open && !d.broken && Math.hypot(d.x - ptx, d.y - pty) > 4 && Math.hypot(d.x - ptx, d.y - pty) < 16);
+    const near = f.doors.filter((d) => !d.sealed && !d.route && !d.locked && !d.open && !d.broken && Math.hypot(d.x - ptx, d.y - pty) > 4 && Math.hypot(d.x - ptx, d.y - pty) < 16);
     return near.length ? this.pick(near) : null;
   }
 
@@ -589,6 +678,235 @@ export class EventDirector {
     }
     this.w.alertZombies((door.x + 0.5) * TILE, (door.y + 0.5) * TILE, 8 * TILE);
     this.tell("BARYKADA", "Coś napiera na drzwi. Deski zaczynają trzeszczeć.", "danger");
+    this.events.push(ev);
+    return true;
+  }
+
+  /* ---------------- 5. nowe spotkania: skrzynia, radio, domofon, zasadzka ---------------- */
+
+  /** Wolny, niewidoczny kafelek z drogą do gracza — miejsce na rekwizyt zdarzenia. */
+  private freeSite(minTiles: number) {
+    const f = this.w.floor();
+    const ptx = this.w.px() / TILE;
+    const pty = this.w.py() / TILE;
+    for (let a = 0; a < 260; a++) {
+      const tx = 2 + Math.floor(this.rand() * Math.max(1, f.w - 4));
+      const ty = 2 + Math.floor(this.rand() * Math.max(1, f.h - 4));
+      if (tx >= f.w || ty >= f.h) continue;
+      if (!this.w.walk(tx, ty, false)) continue;
+      if (Math.hypot(tx - ptx, ty - pty) < minTiles) continue;
+      if (this.w.tileVisible(tx, ty)) continue;
+      if (this.events.some((e) => e.door && e.door.x === tx && e.door.y === ty)) continue;
+      const from = { x: (tx + 0.5) * TILE, y: (ty + 0.5) * TILE };
+      if (!this.path(from, { x: this.w.px(), y: this.w.py() }).length) continue;
+      return { x: tx, y: ty };
+    }
+    return null;
+  }
+
+  private siteDistance(ev: LiveEvent) {
+    if (!ev.door) return Infinity;
+    return Math.hypot((ev.door.x + 0.5) * TILE - this.w.px(), (ev.door.y + 0.5) * TILE - this.w.py());
+  }
+
+  private sitePosition(ev: LiveEvent) {
+    return { x: ((ev.door?.x ?? 0) + 0.5) * TILE, y: ((ev.door?.y ?? 0) + 0.5) * TILE };
+  }
+
+  private resolveSite(ev: LiveEvent) {
+    ev.resolved = true;
+    this.closeChoice();
+    this.drop(ev);
+  }
+
+  private isSite(ev: LiveEvent) {
+    return !!ev.door && !ev.resolved && (ev.kind === "cache" || ev.kind === "radio" || ev.kind === "intercom");
+  }
+
+  /** Prawdziwe miejsce zdarzenia do zaznaczenia na minimapie. */
+  sites() {
+    return this.events.filter((ev) => this.isSite(ev)).map((ev) => ({ kind: ev.kind, x: ev.door!.x, y: ev.door!.y }));
+  }
+
+  private startCache(ev: LiveEvent) {
+    const site = this.freeSite(6);
+    if (!site) return false;
+    const loot: Resource[] = ["ammo", "shells", "bolts", "battery"];
+    ev.door = site;
+    ev.loot = this.pick(loot);
+    this.tell("PORZUCONA SKRZYNIA", "W korytarzu stoi skrzynia z napisem ZAPASY. Wieko wciąż trzyma się zawiasów.", "info");
+    this.events.push(ev);
+    return true;
+  }
+
+  private cacheAmount(loot: Resource) {
+    return loot === "ammo" ? 10 : loot === "battery" ? 25 : 4;
+  }
+
+  private cacheName(loot: Resource) {
+    return loot === "ammo" ? "NABOI" : loot === "shells" ? "ŚRUTU" : loot === "bolts" ? "BEŁTÓW" : "% BATERII";
+  }
+
+  private cacheTalk(ev: LiveEvent) {
+    const loot = ev.loot ?? "ammo";
+    const small = this.cacheAmount(loot);
+    const p = this.sitePosition(ev);
+    this.openChoice("SKRZYNIA Z ZAPASAMI", "Dwa zardzewiałe zawiasy. Możesz je podważyć powoli albo zerwać wieko jednym ruchem.", [
+      {
+        label: `Otwórz po cichu (+${small} ${this.cacheName(loot)})`,
+        enabled: true,
+        run: () => {
+          this.w.give(loot, small);
+          this.w.popup(p.x, p.y - 12, `+${small} ${this.cacheName(loot)}`, "#edc16e");
+          this.w.sound().thanks();
+          this.tell("SKRZYNIA", "Zawiasy puściły bez hałasu. Zapasy lądują w plecaku.", "good");
+          this.resolveSite(ev);
+        },
+      },
+      {
+        label: `Wyważ wieko (+${small * 2} ${this.cacheName(loot)}, hałas)`,
+        enabled: true,
+        run: () => {
+          this.w.give(loot, small * 2);
+          this.w.popup(p.x, p.y - 12, `+${small * 2} ${this.cacheName(loot)}`, "#edc16e");
+          this.w.sound().bang();
+          this.w.quake(2.6);
+          this.w.particles(p.x, p.y, "#b98a52", 12, 60);
+          this.w.alertZombies(p.x, p.y, 9 * TILE);
+          if (this.rand() < 0.45) {
+            const spot = this.darkSpawn(8);
+            if (spot) this.w.addZombie(spot.x, spot.y, "shambler");
+          }
+          this.tell("SKRZYNIA", "Huk niesie się po piętrze. Coś ruszyło się w ciemności.", "danger");
+          this.resolveSite(ev);
+        },
+      },
+      { label: "Zostaw skrzynię", enabled: true, run: () => { this.tell("SKRZYNIA", "Zostawiasz ją nietkniętą.", "info"); this.resolveSite(ev); } },
+    ]);
+  }
+
+  private startRadio(ev: LiveEvent) {
+    const site = this.freeSite(5);
+    if (!site) return false;
+    ev.door = site;
+    ev.beep = 6;
+    this.w.sound().whisper();
+    this.tell("ZŁAPANY SYGNAŁ", "W jednym z pokoi trzeszczy radio. Ktoś powtarza numer piętra.", "info");
+    this.events.push(ev);
+    return true;
+  }
+
+  private radioTalk(ev: LiveEvent) {
+    const p = this.sitePosition(ev);
+    this.openChoice("RADIO KRÓTKOFALOWE", "Trzaski układają się w czyjś głos. Nadawca prosi o potwierdzenie albo podaje współrzędne schowka.", [
+      {
+        label: "Odpowiedz na zew (ryzykowne)",
+        enabled: true,
+        run: () => {
+          if (this.rand() < 0.62) {
+            this.w.give("battery", 30);
+            this.w.give("bolts", 4);
+            this.w.popup(p.x, p.y - 12, "+30% BATERII / +4 BEŁTY", "#9fbe85");
+            this.w.sound().thanks();
+            this.tell("SYGNAŁ", "Głos podaje współrzędne schowka. Bateria i bełty są twoje.", "good");
+          } else {
+            for (let i = 0; i < 2; i++) {
+              const spot = this.darkSpawn(8);
+              if (spot) this.w.addZombie(spot.x, spot.y, i ? "shambler" : "runner");
+            }
+            this.w.alertZombies(p.x, p.y, 10 * TILE);
+            this.w.sound().scream();
+            this.tell("SYGNAŁ", "To nie był człowiek. Odpowiedziało ci coś z klatki.", "danger");
+          }
+          this.resolveSite(ev);
+        },
+      },
+      {
+        label: "Zapisz częstotliwość (+30% baterii)",
+        enabled: true,
+        run: () => {
+          this.w.give("battery", 30);
+          this.w.popup(p.x, p.y - 12, "+30% BATERII", "#edc16e");
+          this.tell("SYGNAŁ", "Zapisujesz częstotliwość i wyłączasz głośnik.", "good");
+          this.resolveSite(ev);
+        },
+      },
+      { label: "Wyłącz radio", enabled: true, run: () => { this.w.sound().powerDown(); this.tell("SYGNAŁ", "Gaśnie zielona dioda. W pokoju robi się ciszej.", "info"); this.resolveSite(ev); } },
+    ]);
+  }
+
+  private startIntercom(ev: LiveEvent) {
+    const site = this.freeSite(5);
+    if (!site) return false;
+    ev.door = site;
+    ev.beep = 4;
+    this.w.sound().knock();
+    this.tell("DOMOFON", "Przy drzwiach odzywa się domofon. Ktoś prosi, żeby go wpuścić.", "warn");
+    this.events.push(ev);
+    return true;
+  }
+
+  private intercomTalk(ev: LiveEvent) {
+    const p = this.sitePosition(ev);
+    const hasAmmo = this.w.count("ammo") >= 6;
+    this.openChoice("GŁOS W DOMOFONIE", "„Jestem za tymi drzwiami... mam broń, ale kończą się naboje. Wpuść mnie.”", [
+      {
+        label: "Wpuść go",
+        enabled: true,
+        run: () => {
+          if (this.rand() < 0.55) {
+            const civ = this.addCiv(p.x, p.y + 10, "flee", ev.id);
+            civ.faction = "friendly";
+            civ.state = "leave";
+            civ.thanked = true;
+            this.w.give("shells", 3);
+            this.w.popup(p.x, p.y - 12, "OCALAŁY: +3 ŚRUTU", "#9fbe85");
+            this.w.sound().thanks();
+            this.tell("DOMOFON", "Ocalały przebiega obok, rzuca ci śrut i znika na klatce.", "good");
+          } else {
+            const spot = this.darkSpawn(7) ?? { x: p.x, y: p.y };
+            this.w.addZombie(spot.x, spot.y, "runner");
+            this.w.alertZombies(p.x, p.y, 7 * TILE);
+            this.w.sound().bang();
+            this.tell("DOMOFON", "Drzwi uderzają o ścianę. To nie był człowiek.", "danger");
+          }
+          this.resolveSite(ev);
+        },
+      },
+      {
+        label: hasAmmo ? "Podaj 6 naboi przez kratkę (+3 bełty)" : "Brak naboi do podania",
+        enabled: hasAmmo,
+        run: () => {
+          if (!this.w.take("ammo", 6)) return;
+          this.w.give("bolts", 3);
+          this.w.popup(p.x, p.y - 12, "−6 NABOI / +3 BEŁTY", "#edc16e");
+          this.w.sound().thanks();
+          this.tell("DOMOFON", "Dłoń znika w kratce, zostawiając garść bełtów.", "good");
+          this.resolveSite(ev);
+        },
+      },
+      { label: "Zignoruj i idź dalej", enabled: true, run: () => { this.tell("DOMOFON", "Głos cichnie po kilku sekundach.", "info"); this.resolveSite(ev); } },
+    ]);
+  }
+
+  private startAmbush(ev: LiveEvent) {
+    const spots: { x: number; y: number }[] = [];
+    const count = 2 + Math.floor(this.rand() * 2);
+    for (let i = 0; i < count; i++) {
+      const spot = this.darkSpawn(8, 4 * TILE);
+      if (spot) spots.push(spot);
+    }
+    if (!spots.length) return false;
+    for (let i = 0; i < spots.length; i++) {
+      this.w.addZombie(spots[i].x, spots[i].y, i === 0 || this.rand() < 0.4 ? "runner" : "shambler");
+      const list = this.w.zombieList();
+      const spawned = list[list.length - 1];
+      if (spawned) ev.zombies.push(spawned.id);
+    }
+    ev.beep = 3 + this.rand() * 2;
+    ev.stage = 0;
+    this.w.sound().whisper();
+    this.tell("ZASADZKA", "Z ciemnych pokoi dobiega szuranie. Ktoś czeka na twój ruch.", "danger");
     this.events.push(ev);
     return true;
   }
@@ -643,7 +961,7 @@ export class EventDirector {
     this.hideProp = spot;
     this.hidden = true;
     this.checkT = 0;
-    this.witnesses = new Set(seers);
+    this.witnesses = new Set([...this.witnesses, ...seers]);
     this.w.sound().hide(true);
     if (this.witnesses.size) this.tell("KRYJÓWKA", "Zamknąłeś się w szafie. Ktoś to widział.", "danger");
     else this.tell("KRYJÓWKA", "Siedzisz w szafie. Oddychaj ciszej.", "info");
@@ -714,6 +1032,12 @@ export class EventDirector {
       }
     }
     for (const ev of this.events) {
+      if (this.isSite(ev) && this.siteDistance(ev) < 28) {
+        if (ev.kind === "cache") this.cacheTalk(ev);
+        else if (ev.kind === "radio") this.radioTalk(ev);
+        else this.intercomTalk(ev);
+        return true;
+      }
       if (ev.kind === "barricade" && ev.door) {
         const d = Math.hypot((ev.door.x + 0.5) * TILE - this.w.px(), (ev.door.y + 0.5) * TILE - this.w.py());
         if (d < 26) {
@@ -726,11 +1050,11 @@ export class EventDirector {
           return true;
         }
       }
-      if (ev.kind === "camp") {
+      if (ev.kind === "camp" || ev.kind === "aid") {
         const alive = ev.civs.map((id) => this.civ(id)).filter((c): c is Civ => !!c && c.state !== "dead" && c.state !== "gone");
         const near = alive.find((c) => Math.hypot(c.x - this.w.px(), c.y - this.w.py()) < 34);
         if (near) {
-          this.campTalk(ev);
+          if (ev.kind === "aid") this.aidTalk(ev); else this.campTalk(ev);
           return true;
         }
       }
@@ -742,15 +1066,22 @@ export class EventDirector {
     if (this.hidden) return "E  wyjdź z szafy";
     if (this.alarm && Math.hypot(this.alarm.x - this.w.px(), this.alarm.y - this.w.py()) < 26) return "E  wyłącz alarm";
     for (const ev of this.events) {
+      if (this.isSite(ev) && this.siteDistance(ev) < 28) {
+        if (ev.kind === "cache") return "E  przeszukaj skrzynię";
+        if (ev.kind === "radio") return "E  zestroić radio";
+        return "E  odpowiedz na domofon";
+      }
+    }
+    for (const ev of this.events) {
       if (ev.kind === "barricade" && ev.door) {
         const d = Math.hypot((ev.door.x + 0.5) * TILE - this.w.px(), (ev.door.y + 0.5) * TILE - this.w.py());
         if (d < 26) return "E  podeprzyj drzwi";
       }
-      if (ev.kind === "camp") {
+      if (ev.kind === "camp" || ev.kind === "aid") {
         const near = ev.civs
           .map((id) => this.civ(id))
           .find((c) => c && c.state !== "dead" && c.state !== "gone" && Math.hypot(c.x - this.w.px(), c.y - this.w.py()) < 34);
-        if (near) return "E  porozmawiaj przy ognisku";
+        if (near) return ev.kind === "aid" ? "E  porozmawiaj z człowiekiem" : "E  porozmawiaj przy ognisku";
       }
     }
     if (this.nearHideSpot()) return "E  schowaj się w szafie";
@@ -864,6 +1195,46 @@ export class EventDirector {
         if (ev.t > 100) this.drop(ev);
         break;
       }
+      case "cache":
+      case "radio":
+      case "intercom": {
+        if (!ev.door || ev.resolved) {
+          this.drop(ev);
+          break;
+        }
+        if (ev.kind !== "cache") {
+          ev.beep = (ev.beep ?? 0) - dt;
+          if (ev.beep <= 0) {
+            ev.beep = ev.kind === "radio" ? 7 + this.rand() * 4 : 9 + this.rand() * 5;
+            if (this.siteDistance(ev) < 12 * TILE) {
+              const p = this.sitePosition(ev);
+              if (ev.kind === "radio") this.w.sound().whisper();
+              else this.w.sound().knock();
+              this.w.particles(p.x, p.y - 4, ev.kind === "radio" ? "#7fbf9f" : "#c7a26a", 3, 24);
+            }
+          }
+        }
+        if (ev.t > 105) this.drop(ev);
+        break;
+      }
+      case "ambush": {
+        ev.beep = (ev.beep ?? 0) - dt;
+        if (ev.beep <= 0 && ev.stage === 0) {
+          ev.stage = 1;
+          const lead = this.w.zombieList().find((z) => ev.zombies.includes(z.id) && !z.dead);
+          if (lead) {
+            this.w.alertZombies(lead.x, lead.y, 10 * TILE);
+            this.w.sound().scream();
+            this.tell("ZASADZKA", "Wypadają zza drzwi. Nie było czasu na przeładowanie.", "danger");
+          }
+        }
+        const alive = ev.zombies.filter((id) => this.w.zombieList().some((z) => z.id === id && !z.dead));
+        if (!alive.length) {
+          this.tell("ZASADZKA UDAREMNIONA", "Korytarz znowu jest pusty. Na chwilę.", "good");
+          this.drop(ev);
+        } else if (ev.t > 110) this.drop(ev);
+        break;
+      }
       case "runners": {
         const chasers = ev.zombies.filter((id) => this.w.zombieList().some((z) => z.id === id && !z.dead));
         const alive = ev.civs.map((id) => this.civ(id)).filter((c): c is Civ => !!c && c.state !== "dead" && c.state !== "gone");
@@ -909,6 +1280,11 @@ export class EventDirector {
           this.camp = null;
           this.drop(ev);
         }
+        break;
+      }
+      case "aid": {
+        const alive = ev.civs.map((id) => this.civ(id)).filter((c): c is Civ => !!c && c.state !== "dead" && c.state !== "gone");
+        if (!alive.length || ev.t > 180) this.drop(ev);
         break;
       }
     }
@@ -976,7 +1352,7 @@ export class EventDirector {
   }
 
   /** Trafienie cywila przez gracza — zwykłe zasady obrażeń. */
-  hurtCiv(civ: Civ, dmg: number, dx: number, dy: number) {
+  hurtCiv(civ: Civ, dmg: number, dx: number, dy: number, fromPlayer = true) {
     if (civ.state === "dead" || civ.state === "gone") return;
     civ.hp -= dmg;
     civ.hurtFlash = 0.12;
@@ -998,7 +1374,7 @@ export class EventDirector {
       if (this.escortId === civ.id) this.escortId = -1;
       return;
     }
-    if (civ.faction !== "hostile") {
+    if (fromPlayer && civ.faction !== "hostile") {
       const ev = this.events.find((e) => e.id === civ.eventId);
       for (const mate of this.civs) if (mate.eventId === civ.eventId) mate.faction = "hostile";
       if (ev?.kind === "camp") this.tell("OBOZOWISKO WROGIE", "Strzelałeś do nich. Teraz odpowiadają ogniem.", "danger");
@@ -1014,6 +1390,8 @@ export class EventDirector {
   }
 
   private stepCiv(civ: Civ, tx: number, ty: number, dt: number, speed: number) {
+    const door = this.w.doorAt(Math.floor(tx / TILE), Math.floor(ty / TILE));
+    if (door && !door.open && !door.broken && !door.sealed && !door.locked && !door.route) this.w.openDoor(door.x, door.y);
     const dx = tx - civ.x;
     const dy = ty - civ.y;
     const len = Math.hypot(dx, dy) || 1;
@@ -1200,6 +1578,39 @@ export class EventDirector {
         ctx.fillRect(x - 1, y - 1, 3, 3);
       }
     }
+    for (const ev of this.events) {
+      if (!this.isSite(ev)) continue;
+      const p = this.sitePosition(ev);
+      const x = Math.round(p.x - camX);
+      const y = Math.round(p.y - camY);
+      const blink = Math.sin(time * 6 + ev.id) > 0;
+      if (ev.kind === "cache") {
+        ctx.fillStyle = "#090d0f"; ctx.fillRect(x - 8, y + 5, 16, 2);
+        ctx.fillStyle = "#3a2b1f"; ctx.fillRect(x - 8, y - 5, 16, 10);
+        ctx.fillStyle = "#7d5936"; ctx.fillRect(x - 7, y - 4, 14, 8);
+        ctx.fillStyle = "#a87b48"; ctx.fillRect(x - 6, y - 5, 12, 2);
+        ctx.fillStyle = "#5a4128"; ctx.fillRect(x - 7, y - 1, 14, 1); ctx.fillRect(x - 7, y + 3, 14, 1);
+        ctx.fillStyle = "#b9b6a2";
+        ctx.fillRect(x - 8, y - 5, 2, 2); ctx.fillRect(x + 6, y - 5, 2, 2);
+        ctx.fillRect(x - 8, y + 3, 2, 2); ctx.fillRect(x + 6, y + 3, 2, 2);
+        ctx.fillStyle = "#e8c77e"; ctx.fillRect(x - 2, y, 4, 2);
+      } else if (ev.kind === "radio") {
+        ctx.fillStyle = "#101618"; ctx.fillRect(x - 7, y - 4, 14, 9);
+        ctx.fillStyle = "#3e4a49"; ctx.fillRect(x - 6, y - 3, 12, 7);
+        ctx.fillStyle = "#66736e"; ctx.fillRect(x - 6, y - 3, 12, 1);
+        ctx.fillStyle = "#1b2324"; ctx.fillRect(x - 5, y - 1, 6, 4);
+        for (let i = 0; i < 3; i++) { ctx.fillStyle = "#83918a"; ctx.fillRect(x - 4 + i * 2, y, 1, 2); }
+        ctx.fillStyle = blink ? "#a8e4a0" : "#4b6b52"; ctx.fillRect(x + 3, y - 2, 2, 2);
+        ctx.fillStyle = "#a7aca1"; ctx.fillRect(x + 4, y - 11, 1, 8);
+        ctx.fillRect(x + 4, y - 12, 2, 1);
+      } else {
+        ctx.fillStyle = "#222b2b"; ctx.fillRect(x - 4, y - 6, 8, 12);
+        ctx.fillStyle = "#59655f"; ctx.fillRect(x - 3, y - 5, 6, 10);
+        ctx.fillStyle = "#293331"; ctx.fillRect(x - 2, y - 4, 4, 5);
+        for (let i = 0; i < 3; i++) { ctx.fillStyle = "#8b988f"; ctx.fillRect(x - 1, y - 3 + i, 2, 1); }
+        ctx.fillStyle = blink ? "#e8c77e" : "#6d6245"; ctx.fillRect(x - 1, y + 2, 2, 2);
+      }
+    }
   }
 
   drawCiv(ctx: CanvasRenderingContext2D, civ: Civ, camX: number, camY: number) {
@@ -1305,6 +1716,14 @@ export class EventDirector {
     }
     if (this.alarm && Math.sin(performance.now() / 110) > 0) {
       out.push({ x: this.alarm.x, y: this.alarm.y, r: 44, inner: "rgba(226,72,60,0.6)", mid: "rgba(150,36,30,0.2)" });
+    }
+    for (const ev of this.events) {
+      if (!this.isSite(ev)) continue;
+      const p = this.sitePosition(ev);
+      const pulse = 0.8 + 0.2 * Math.sin(performance.now() / 220 + ev.id);
+      if (ev.kind === "radio") out.push({ x: p.x, y: p.y, r: 34 * pulse, inner: `rgba(132,206,158,${0.38 * pulse})`, mid: "rgba(70,130,100,0.14)" });
+      else if (ev.kind === "intercom") out.push({ x: p.x, y: p.y, r: 26 * pulse, inner: `rgba(222,184,110,${0.3 * pulse})`, mid: "rgba(140,100,50,0.1)" });
+      else out.push({ x: p.x, y: p.y, r: 20 * pulse, inner: `rgba(226,190,116,${0.2 * pulse})`, mid: "rgba(140,100,50,0.08)" });
     }
     return out;
   }

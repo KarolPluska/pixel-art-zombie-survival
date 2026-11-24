@@ -1,3 +1,4 @@
+import type { EnvironmentSound } from "./environment";
 import type { Theme } from "./palette";
 import type { ZombieKind } from "./types";
 
@@ -397,6 +398,76 @@ export class Sfx {
   powerUp() {
     this.tone(90, 0.5, 0.09, "sawtooth", 320, 0, true);
     this.tone(1400, 0.08, 0.05, "square", 900, 0.42);
+  }
+
+  liftCall() {
+    this.tone(740, 0.11, 0.1, "sine", 990);
+    this.tone(990, 0.09, 0.08, "sine", 740, 0.13);
+    this.noise(0.34, 520, 0.15, "lowpass", 0.9, 0.2, true);
+  }
+
+  liftMove() {
+    this.tone(68, 1.2, 0.18, "sawtooth", 115);
+    this.noise(330, 0.8, 0.12, "lowpass", 0.7, 0, true);
+    this.tone(220, 0.07, 0.07, "triangle", 176, 0.12);
+  }
+
+  liftRattle() {
+    this.noise(570, 0.16, 0.24, "lowpass", 1.7, 0, true);
+    this.tone(91, 0.22, 0.16, "triangle", 53, 0.02);
+  }
+
+  liftStop() {
+    this.noise(510, 0.22, 0.3, "lowpass", 0.9, 0, true);
+    this.tone(74, 0.32, 0.24, "sawtooth", 35, 0.02);
+    this.tone(820, 0.08, 0.08, "triangle", 620, 0.31);
+  }
+
+  ladder() {
+    this.noise(880, 0.09, 0.15, "bandpass", 1.3);
+    this.tone(178, 0.12, 0.1, "triangle", 120, 0.1);
+    this.tone(236, 0.1, 0.075, "triangle", 152, 0.36);
+  }
+
+  device(kind: "radio" | "tv", on: boolean) {
+    if (!on) { this.tone(310, 0.06, 0.06, "square", 180); return; }
+    this.noise(kind === "tv" ? 0.22 : 0.13, kind === "tv" ? 1900 : 2700, 0.1, "bandpass", 1.2);
+    this.tone(kind === "tv" ? 190 : 520, 0.08, 0.05, "triangle", kind === "tv" ? 160 : 650, 0.04);
+  }
+
+  explosion() {
+    this.noise(0.65, 310, 0.68, "lowpass", 0.7, 0, true);
+    this.noise(0.32, 1850, 0.38, "bandpass", 0.8, 0.03, true);
+    this.tone(76, 0.52, 0.42, "sawtooth", 28);
+  }
+
+  machete() {
+    this.noise(0.1, 2350, 0.15, "highpass", 0.8);
+    this.tone(420, 0.08, 0.07, "triangle", 180, 0.02);
+  }
+
+  environment(kind: EnvironmentSound, gain: number) {
+    if (this.muted || !this.ctx) return;
+    const tone = (hz: number, time: number, v: number, end: number, delay = 0) => this.tone(hz, time, v * gain, "triangle", end, delay);
+    const noise = (hz: number, time: number, v: number, delay = 0, echo = false) => this.noise(time, hz, v * gain, "bandpass", 1.15, delay, echo);
+    switch (kind) {
+      case "arc":
+        for (let i = 0; i < 4; i++) noise(2700 + i * 520, 0.05 + i * 0.014, 0.17 + i * 0.04, 0.11 * i);
+        break;
+      case "shock": noise(2580, 0.17, 0.32, 0, true); tone(137, 0.19, 0.20, 280); break;
+      case "switch": tone(1120, 0.065, 0.11, 710); noise(680, 0.08, 0.26, 0.03); break;
+      case "strain": tone(146, 0.26, 0.18, 93); noise(540, 0.24, 0.18); break;
+      case "scrape": noise(360, 0.34, 0.28, 0, true); noise(1450, 0.26, 0.19); tone(88, 0.32, 0.09, 52); break;
+      case "crack": noise(1260, 0.08, 0.24); noise(2700, 0.06, 0.14, 0.065); break;
+      case "collapse": tone(94, 0.46, 0.36, 31); noise(450, 0.53, 0.55, 0, true); noise(1650, 0.42, 0.28, 0.08, true); break;
+      case "hiss": noise(2700, 0.75, 0.23); noise(4100, 0.48, 0.13, 0.18); break;
+      case "steam": noise(1600, 0.85, 0.48, 0, true); noise(3650, 0.67, 0.26); break;
+      case "valve": tone(412, 0.19, 0.11, 176); noise(610, 0.16, 0.22, 0.05); break;
+      case "glass": noise(5600, 0.09, 0.22); tone(4100, 0.07, 0.09, 2650, 0.04); break;
+      case "cans": tone(1330, 0.12, 0.17, 910); tone(925, 0.1, 0.12, 630, 0.08); noise(1540, 0.11, 0.17); break;
+      case "planks": tone(195, 0.22, 0.19, 72); noise(850, 0.13, 0.18); break;
+      case "flare": tone(122, 0.32, 0.3, 44); noise(970, 0.52, 0.52, 0, true); break;
+    }
   }
 
   hide(open: boolean) {

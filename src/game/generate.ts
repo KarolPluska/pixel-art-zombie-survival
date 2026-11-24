@@ -1,6 +1,10 @@
 import { FLOOR_META, MAP_H, MAP_W, NOTES, TILE, Tile } from "./palette";
 import { makeRng } from "./rng";
+import { hash2 } from "./rng";
 import { DISCOVERIES } from "./inventory";
+import { populateEnvironment, validateEnvironment } from "./environment-layout";
+import { installVerticalQuests, installVerticalRoutes } from "./vertical-layout";
+import { installTacticalContent } from "./tactical-layout";
 import type {
   DecalSpawn,
   DoorInfo,
@@ -454,6 +458,7 @@ function makeLight(x: number, y: number, kind: LightFixture["kind"], flicker: bo
 
 function buildLights(b: Build, rng: Rng, decay: number, corridors: number[]) {
   for (const r of b.rooms) {
+    if (b.roomZones[r.id] === "KORYTARZ" && r.h === 1) continue;
     const c = { x: r.x + Math.floor(r.w / 2), y: r.y + Math.floor(r.h / 2) };
     if (r.role === "stairs") b.lights.push(makeLight(c.x, c.y, "emergency", true, r.id, 5.2));
     else if (r.lit) {
@@ -870,6 +875,302 @@ function buildFloor(index: number, seed: number): FloorData | null {
   };
 }
 
+export const LAYOUT_FAMILIES = ["MAŁE PODESTY", "PIERŚCIEŃ", "DWA SKRZYDŁA", "ŁAMANE KORYTARZE", "MIESZKANIA PRZECHODNIE", "BRYŁA L/U", "WSPÓLNY HOL"] as const;
+
+export function layoutProfile(seed: number, floor = 0) {
+  const rng = makeRng((seed + floor * 131) ^ 0x2a719d3b);
+  return { family: rng.int(LAYOUT_FAMILIES.length), start: rng.int(6) };
+}
+
+const STAIR_ANCHORS = [
+  { x: 10, y: 9 }, { x: 43, y: 9 }, { x: 10, y: 77 },
+  { x: 43, y: 77 }, { x: 20, y: 9 }, { x: 35, y: 77 },
+];
+
+export function stairAnchor(seed: number, boundary: number) {
+  if (boundary === 9) return { x: 15, y: 66 }; // roof's physical arrival
+  const first = Math.floor(hash2(seed, boundary, 777) * STAIR_ANCHORS.length);
+  const previous = boundary > 0 ? stairAnchor(seed, boundary - 1) : null;
+  const roof = boundary === 8 ? { x: 15, y: 66 } : null;
+  for (let i = 0; i < STAIR_ANCHORS.length; i++) {
+    const p = STAIR_ANCHORS[(first + i) % STAIR_ANCHORS.length];
+    if ((!previous || distCell(previous, p) >= 11) && (!roof || distCell(roof, p) >= 11)) return p;
+  }
+  return STAIR_ANCHORS[first];
+}
+
+type Cell = { x: number; y: number };
+const distCell = (a: Cell, c: Cell) => Math.abs(a.x - c.x) + Math.abs(a.y - c.y);
+let lastLayoutFailure = "";
+
+/** Topology first: rooms, shafts and mandatory routes are placed before any furniture or loot. */
+function buildVariedFloor(index: number, seed: number, buildingSeed: number): FloorData | null {
+  const meta = FLOOR_META[index];
+  const rng = makeRng(seed ^ 0x2a719d3b);
+  const dressing = makeRng(seed ^ 0x61d3ac17);
+  const profile = layoutProfile(buildingSeed, index);
+  const family = profile.family;
+  const b = newBuild();
+  const service = index <= 1;
+  const reserved = new Uint8Array(W * H);
+  const graph = new Uint8Array(W * H);
+  const protectedRooms = [stairAnchor(buildingSeed, index), ...(index > 0 ? [stairAnchor(buildingSeed, index - 1)] : [])];
+  const courtyard = {x:19+rng.int(3),y:30+rng.int(4),w:16+rng.int(3),h:25+rng.int(4)};
+  const isVoid = (x:number,y:number) => {
+    // The shared shafts and stair anchors always take precedence over local courtyards/voids.
+    if (protectedRooms.some(p=>Math.abs(x-p.x)<=4&&Math.abs(y-p.y)<=4)) return false;
+    if (family===1) return x>=courtyard.x&&x<courtyard.x+courtyard.w&&y>=courtyard.y&&y<courtyard.y+courtyard.h;
+    if (family===2) return x>=21&&x<35&&(y<32||y>55);
+    if (family===5) return x>=34&&x<49&&y<31 || (profile.start%2===0&&x>=7&&x<21&&y>57);
+    return false;
+  };
+  const line = (a: Cell, c: Cell, width = 2) => {
+    const minX = Math.min(a.x, c.x), minY = Math.min(a.y, c.y);
+    const spanX = Math.abs(a.x - c.x), spanY = Math.abs(a.y - c.y);
+    if (spanX && spanY) return;
+    for (let y = minY; y <= minY + spanY; y++) for (let x = minX; x <= minX + spanX; x++) {
+      for (let yy = y; yy < y + width; yy++) for (let xx = x; xx < x + width; xx++) {
+        if (xx < 4 || xx >= W - 4 || yy < 4 || yy >= H - 4 || reserved[idx(xx, yy)] || isVoid(xx,yy)) continue;
+        graph[idx(xx, yy)] = 1;
+      }
+    }
+  };
+  const centres: Cell[] = [];
+  const col = [10 + rng.int(6), 25 + rng.int(7), 39 + rng.int(6)];
+  const row = [16 + rng.int(8), 39 + rng.int(10), 63 + rng.int(8)];
+  for (let j = 0; j < 3; j++) for (let i = 0; i < 3; i++) {
+    centres.push({ x: col[i] + (i === 1 ? rng.int(5) - 2 : 0), y: row[j] + (j === 1 ? rng.int(5) - 2 : 0) });
+  }
+  const up = protectedRooms[0];
+  const down = index > 0 ? stairAnchor(buildingSeed, index - 1) : null;
+  if (down && distCell(down, up) < 11) {lastLayoutFailure="overlapping stairs";return null;}
+  for (const p of protectedRooms) for (let y = p.y - 3; y <= p.y + 3; y++) for (let x = p.x - 3; x <= p.x + 3; x++) {
+    if (inb(x, y)) reserved[idx(x, y)] = 1;
+  }
+
+  // Seven graph families use different edge sets, node positions and optional loops.
+  const families: [number, number][][] = [
+    [[0,1],[1,2],[0,3],[2,5],[3,4],[4,7],[5,8],[6,7],[7,8]],
+    [[0,1],[1,2],[2,5],[5,8],[8,7],[7,6],[6,3],[3,0]],
+    [[0,3],[3,6],[2,5],[5,8],[3,4],[4,5],[7,8]],
+    [[0,1],[1,4],[4,3],[3,6],[6,7],[7,8],[8,5],[5,2],[4,5]],
+    [[0,3],[3,6],[3,4],[4,7],[7,8],[4,5],[5,2],[1,2]],
+    [[0,1],[0,3],[3,4],[4,5],[5,8],[8,7],[7,6],[3,6]],
+    [[4,1],[4,3],[4,5],[4,7],[0,1],[1,2],[3,6],[5,8],[6,7]],
+  ];
+  let edges = families[family].slice();
+  if (rng.chance(0.45)) edges.splice(rng.int(edges.length), 1, rng.pick(edges));
+  if (family !== 1 && rng.chance(0.6)) edges.push(rng.pick([[0,1],[1,2],[3,4],[4,5],[6,7],[7,8],[0,3],[1,4],[2,5],[3,6],[4,7],[5,8]]));
+  for (const [a, c] of edges) {
+    const start = centres[a], end = centres[c];
+    const broad = family === 6 && (a === 4 || c === 4) ? 4 : family === 1 ? 3 : 2;
+    if (start.x === end.x || start.y === end.y) line(start, end, broad);
+    else if (rng.chance(0.5)) { line(start, { x: end.x, y: start.y }, broad); line({ x: end.x, y: start.y }, end, broad); }
+    else { line(start, { x: start.x, y: end.y }, broad); line({ x: start.x, y: end.y }, end, broad); }
+  }
+  for (const p of centres) if(!isVoid(p.x,p.y)) line(p, p, family === 6 && distCell(p, centres[4]) < 2 ? 6 : 3);
+  // Fixed facade shafts are consistent between floors but their approaches vary.
+  for (const endpoint of [{ x: 4, y: 43 }, { x: 51, y: 19 }, { x: 51, y: 35 }]) {
+    const target = centres.filter(p=>!isVoid(p.x,p.y)).sort((a, c) => distCell(a, endpoint) - distCell(c, endpoint))[0];
+    line(endpoint, { x: target.x, y: endpoint.y }, 2);
+    line({ x: target.x, y: endpoint.y }, target, 2);
+  }
+  // Short facade galleries provide sites for hidden rooms without restoring a full-length trunk.
+  for (const [edge, base] of [[4, 25], [50, 25], [4, 56], [50, 56]] as const) {
+    const y = base + rng.int(10) - 5;
+    line({x:edge,y},{x:edge,y:y+12},2);
+    const midpoint={x:edge,y:y+4};
+    const near=centres.filter(p=>!isVoid(p.x,p.y)).sort((a,c)=>distCell(a,midpoint)-distCell(c,midpoint))[0];
+    line(midpoint,{x:near.x,y:midpoint.y},2);
+    line({x:near.x,y:midpoint.y},near,2);
+  }
+  // Intersecting corridor strips are represented as individual rooms for local lighting and zones.
+  const visited = new Uint8Array(W * H);
+  for (let y = 4; y < H - 4; y++) for (let x = 4; x < W - 4; x++) {
+    if (!graph[idx(x,y)] || visited[idx(x,y)]) continue;
+    let w = 1;
+    while (x+w < W-4 && graph[idx(x+w,y)] && !visited[idx(x+w,y)] && w < 10) w++;
+    for (let xx=x;xx<x+w;xx++) visited[idx(xx,y)]=1;
+    const r = addRoom(b,x,y,w,1,"corridor","normal",meta.decay,service,rng);
+    r.lit=true;
+  }
+  // Keep every graph tile even where the strips cross reserved areas.
+  for (let y=4;y<H-4;y++) for(let x=4;x<W-4;x++) if(graph[idx(x,y)]) b.tiles[idx(x,y)]=Tile.Floor;
+
+  const stairRooms: Room[] = [];
+  for (const [k,p] of protectedRooms.entries()) {
+    const r=addRoom(b,p.x-2,p.y-2,5,5,"stair",k===0?"stairs":"start",meta.decay,service,rng);
+    r.lit=true;
+    stairRooms.push(r);
+    b.tiles[idx(p.x,p.y)] = k===0?Tile.StairsUp:Tile.StairsDown;
+    // Connect the landing through one deliberate doorway and a short spur.
+    const targets=centres.slice().sort((a,c)=>distCell(a,p)-distCell(c,p));
+    const target=targets.find(c=>!isVoid(c.x,c.y))??targets[0];
+    const dx=target.x-p.x,dy=target.y-p.y;
+    const door= Math.abs(dx)>Math.abs(dy) ? {x:p.x+(dx>0?3:-3),y:p.y} : {x:p.x,y:p.y+(dy>0?3:-3)};
+    const outside={x:door.x+(door.x-p.x?Math.sign(door.x-p.x):0),y:door.y+(door.y-p.y?Math.sign(door.y-p.y):0)};
+    line(outside,{x:target.x,y:outside.y},2);
+    line({x:target.x,y:outside.y},target,2);
+    // Re-carve just this spur without crossing any of the protected stair interiors.
+    for(let yy=4;yy<H-4;yy++)for(let xx=4;xx<W-4;xx++)if(graph[idx(xx,yy)]&&!reserved[idx(xx,yy)]&&b.tiles[idx(xx,yy)]===Tile.Wall){
+      b.tiles[idx(xx,yy)]=Tile.Floor;b.floorStyle[idx(xx,yy)]=3;
+    }
+    addDoor(b,door.x,door.y,k===0 && index>0 && index%2===1);
+  }
+
+  // Reserved stair landings and courtyards can split a branch. Rejoin every graph
+  // component with the shortest legal detour before placing rooms or furniture.
+  const graphComponents=()=>{
+    const seen=new Uint8Array(W*H),groups:number[][]=[];
+    for(let i=0;i<graph.length;i++){
+      if(!graph[i]||seen[i])continue;
+      const q=[i];seen[i]=1;
+      for(let head=0;head<q.length;head++){
+        const pos=q[head],x=pos%W,y=Math.floor(pos/W);
+        for(const [dx,dy] of N4){const nx=x+dx,ny=y+dy,ni=ny*W+nx;
+          if(nx<0||nx>=W||ny<0||ny>=H||seen[ni]||!graph[ni])continue;
+          seen[ni]=1;q.push(ni);
+        }
+      }
+      groups.push(q);
+    }
+    return groups.sort((a,c)=>c.length-a.length);
+  };
+  for(let attempt=0;attempt<16;attempt++){
+    const groups=graphComponents();
+    if(groups.length<=1)break;
+    const root=new Uint8Array(W*H),prev=new Int32Array(W*H).fill(-1),q:number[]=[];
+    for(const i of groups[0]){root[i]=1;prev[i]=i;q.push(i);}
+    let found=-1;
+    for(let head=0;head<q.length&&found<0;head++){
+      const pos=q[head],x=pos%W,y=Math.floor(pos/W);
+      for(const [dx,dy] of N4){const nx=x+dx,ny=y+dy,ni=ny*W+nx;
+        if(nx<4||nx>=W-4||ny<4||ny>=H-4||prev[ni]>=0||reserved[ni])continue;
+        prev[ni]=pos;
+        if(graph[ni]&&!root[ni]){found=ni;break;}
+        q.push(ni);
+      }
+    }
+    if(found<0){lastLayoutFailure="disconnected corridor graph";return null;}
+    for(let pos=found;!root[pos];pos=prev[pos]){
+      graph[pos]=1;
+      const x=pos%W,y=Math.floor(pos/W);
+      if(x+1<W-4&&!reserved[idx(x+1,y)])graph[idx(x+1,y)]=1;
+    }
+  }
+  if(graphComponents().length>1){lastLayoutFailure="corridor graph still disconnected";return null;}
+  for(let y=4;y<H-4;y++)for(let x=4;x<W-4;x++){
+    const i=idx(x,y);
+    if(!graph[i]||b.roomOf[i]>=0)continue;
+    const r=addRoom(b,x,y,1,1,"corridor","normal",meta.decay,service,rng);
+    r.lit=true;
+  }
+
+  // Rooms are packed into the spaces left by the actual connected circulation graph.
+  const roomsAdded: Room[]=[];
+  const canRoom=(x:number,y:number,w:number,h:number)=>{
+    if(x<6||y<5||x+w>W-6||y+h>H-5)return false;
+    for(let yy=y-1;yy<=y+h;yy++)for(let xx=x-1;xx<=x+w;xx++) if(b.tiles[idx(xx,yy)]!==Tile.Wall||reserved[idx(xx,yy)]||isVoid(xx,yy))return false;
+    for(let yy=y;yy<y+h;yy++) if(PASSABLE.has(b.tiles[idx(x-2,yy)])||PASSABLE.has(b.tiles[idx(x+w+1,yy)]))return true;
+    for(let xx=x;xx<x+w;xx++) if(PASSABLE.has(b.tiles[idx(xx,y-2)])||PASSABLE.has(b.tiles[idx(xx,y+h+1)]))return true;
+    return false;
+  };
+  for(let attempts=0;attempts<1500&&roomsAdded.length<55;attempts++){
+    const w=4+rng.int(family===2?9:family===0?4:7),h=3+rng.int(family===4?8:7);
+    const x=6+rng.int(W-12-w),y=5+rng.int(H-10-h);
+    if(!canRoom(x,y,w,h))continue;
+    const zone=service?rng.pick(serviceZones(rng)):rng.pick(apartmentZones(rng,meta.decay));
+    const r=addRoom(b,x,y,w,h,zone,"normal",meta.decay,service,rng);
+    roomsAdded.push(r);
+  }
+  if(roomsAdded.length<10){lastLayoutFailure=`too few rooms (${roomsAdded.length})`;return null;}
+
+  // Join rooms to corridors or neighbouring rooms. Every room must have an entrance.
+  for(const r of roomsAdded){
+    const options: {x:number;y:number; corridor:boolean}[]=[];
+    for(let y=r.y;y<r.y+r.h;y++)for(const side of [-1,1]){
+      const x=side<0?r.x-1:r.x+r.w;
+      const farX=x+side;
+      if(b.tiles[idx(x,y)]===Tile.Wall && PASSABLE.has(b.tiles[idx(farX,y)])) options.push({x,y,corridor:b.roomZones[b.roomOf[idx(farX,y)]]==="KORYTARZ"});
+    }
+    for(let x=r.x;x<r.x+r.w;x++)for(const side of [-1,1]){
+      const y=side<0?r.y-1:r.y+r.h,farY=y+side;
+      if(b.tiles[idx(x,y)]===Tile.Wall && PASSABLE.has(b.tiles[idx(x,farY)])) options.push({x,y,corridor:b.roomZones[b.roomOf[idx(x,farY)]]==="KORYTARZ"});
+    }
+    const ordered=options.sort((a,c)=>Number(c.corridor)-Number(a.corridor)||a.x-c.x||a.y-c.y);
+    if(ordered[0]) addDoor(b,ordered[0].x,ordered[0].y,false);
+    if(ordered.length>1 && rng.chance(family===4?0.85:0.5)) {
+      const alt=ordered.find((o)=>distCell(o,ordered[0])>=3);
+      if(alt) addDoor(b,alt.x,alt.y,false);
+    }
+  }
+
+  // Reserve one real corridor-connected workshop and storage room for contextual mandatory loot.
+  const firstWorkshop=roomsAdded.find(r=>b.roomZones[r.id]==="WARSZTAT"||b.roomZones[r.id]==="SCHOWEK");
+  if(!firstWorkshop) {b.roomZones[roomsAdded[0].id]="WARSZTAT";b.zones[roomsAdded[0].id]="workshop";}
+  const bedroom=roomsAdded.find(r=>b.zones[r.id]==="bedroom"&&r.w>=5);
+  if(!bedroom){const r=roomsAdded[roomsAdded.length-1];b.zones[r.id]="bedroom";b.roomZones[r.id]="SYPIALNIA";}
+  const corridor=b.rooms.find(r=>b.roomZones[r.id]==="KORYTARZ"&&r.w>=4);
+  if(!corridor){lastLayoutFailure="no long corridor";return null;}
+  // The actual start may be a room, work area, lobby or stair landing, independent of exit.
+  let startRoom=stairRooms[1]??roomsAdded[profile.start%roomsAdded.length];
+  if(index===0){
+    const pool=roomsAdded.filter(r=>r.w>=5&&r.h>=4);
+    if(pool.length)startRoom=pool[profile.start%pool.length];
+    startRoom.role="start";
+    startRoom.lit=true;
+    b.zones[startRoom.id]=rng.pick(["workshop","storage","office","living","bedroom"]);
+    b.roomZones[startRoom.id]=ZONE_NAME[b.zones[startRoom.id]];
+  }
+  // Furnish only after all doors and passages exist.
+  for(const r of b.rooms) if(r.w>=3&&r.h>=3 && b.zones[r.id]!=="corridor")furnishRoom(b,r,b.zones[r.id],meta.decay);
+  addSurfaceDetails(b,dressing,index,meta.decay);
+  if(!stockFloor(b,index,index>0&&index%2===1,startRoom)){lastLayoutFailure="mandatory loot could not be placed";return null;}
+  if(index===0){
+    const host=b.props.find(p=>p.loot==="hatchet");
+    if(!host){lastLayoutFailure="no start weapon";return null;}
+  }
+  sealRooms(b);
+  paintWallBorders(b,meta.decay,service);
+  placeWindows(b,dressing,meta.decay);
+  buildLights(b,dressing,meta.decay,[]);
+  for(let y=7;y<H-7;y++)for(let x=8;x<W-8;x++){
+    const rid=b.roomOf[idx(x,y)];
+    if(rid>=0&&b.roomZones[rid]==="KORYTARZ"&&b.tiles[idx(x,y)]===Tile.Floor&&(x*7+y*11+seed)%47===0)
+      b.lights.push(makeLight(x,y,"fluor",dressing.chance(.28+meta.decay*.35),rid,4.6));
+  }
+  b.occ.fill(0);
+  for(const p of b.props)if(p.solid)for(let y=p.y;y<p.y+p.h;y++)for(let x=p.x;x<p.x+p.w;x++)b.occ[idx(x,y)]=1;
+  carveExtraBreaches(b,dressing,meta.decay);
+  spawnCorpses(b,dressing,index);
+  spawnSurvivors(b,dressing,index,startRoom);
+  const spawns=spawnZombies(b,dressing,index,startRoom);
+  const startCell = index===0 ? Array.from({length:startRoom.w*startRoom.h},(_,n)=>({x:startRoom.x+n%startRoom.w,y:startRoom.y+Math.floor(n/startRoom.w)}))
+    .filter(p=>b.tiles[idx(p.x,p.y)]===Tile.Floor&&!b.occ[idx(p.x,p.y)])
+    .sort((a,c)=>distCell(a,{x:startRoom.x+startRoom.w/2,y:startRoom.y+startRoom.h/2})-distCell(c,{x:startRoom.x+startRoom.w/2,y:startRoom.y+startRoom.h/2}))[0] : down!;
+  if(!startCell){lastLayoutFailure="start occupied by furniture";return null;}
+  return {index,theme:meta.theme,name:meta.name,sub:`${meta.sub} · ${LAYOUT_FAMILIES[family]}`,seed,w:W,h:H,
+    tiles:b.tiles,floorStyle:b.floorStyle,wallStyle:b.wallStyle,rooms:b.rooms,roomZones:b.roomZones,roomOf:b.roomOf,
+    props:b.props,doors:b.doors,zombies:spawns,windows:b.windows,decals:b.decals,wallDecals:b.wallDecals,
+    breaches:b.breaches,corpses:b.corpses,survivors:b.survivors,lights:b.lights,
+    playerStart:{x:(startCell.x+.5)*TILE,y:(startCell.y+.5)*TILE},stairsUp:up,stairsDown:index>0?down:null,
+    locked:index>0&&index%2===1,keyPropId:b.props.find(p=>p.loot==="key")?.id??null,flare:null};
+}
+
+export function diagnoseVariedFloor(index: number, seed: number, buildingSeed: number) {
+  const floor = buildVariedFloor(index, seed, buildingSeed);
+  if (!floor) return lastLayoutFailure;
+  const geometry = validateFloor(floor);
+  if (geometry) return geometry;
+  installVerticalRoutes(floor, buildingSeed);
+  populateEnvironment(floor);
+  installVerticalQuests(floor, buildingSeed);
+  if (!floor.environment?.features.some(f=>f.kind==="wall")) return "no fragile annex";
+  if (!floor.environment?.features.some(f=>f.kind==="obstruction")) return "no blocked annex";
+  installTacticalContent(floor);
+  return validateFloor(floor) ?? "ok";
+}
+
 function carveExtraBreaches(b: Build, rng: Rng, decay: number) {
   const want = 4 + Math.round(decay * 12);
   let made = 0;
@@ -1173,7 +1474,7 @@ function reachableTiles(floor: FloorData, beforeKey: boolean) {
     if (!p.solid) continue;
     for (let y = p.y; y < p.y + p.h; y++) for (let x = p.x; x < p.x + p.w; x++) blocked[idx(x, y)] = 1;
   }
-  if (beforeKey) for (const d of floor.doors) if (d.locked) blocked[idx(d.x, d.y)] = 1;
+  for (const d of floor.doors) if (d.sealed || (beforeKey && d.locked)) blocked[idx(d.x, d.y)] = 1;
   const seen = new Uint8Array(W * H);
   const queue = new Int32Array(W * H);
   const start = idx(Math.floor(floor.playerStart.x / TILE), Math.floor(floor.playerStart.y / TILE));
@@ -1208,7 +1509,7 @@ function canSearchFrom(seen: Uint8Array, p: { x: number; y: number; w: number; h
 function validateGeometry(floor: FloorData): string | null {
   const t = floor.tiles;
   for (const r of floor.rooms) {
-    if (floor.roomZones[r.id] === "KORYTARZ" || floor.roomZones[r.id] === "DACH") continue;
+    if (["KORYTARZ", "DACH", "WINDA OSOBOWA", "PION TECHNICZNY", "KLATKA B"].includes(floor.roomZones[r.id])) continue;
     for (let y = r.y - 1; y <= r.y + r.h; y++) {
       for (let x = r.x - 1; x <= r.x + r.w; x++) {
         const onBorder = x === r.x - 1 || x === r.x + r.w || y === r.y - 1 || y === r.y + r.h;
@@ -1234,6 +1535,7 @@ export function validateFloor(floor: FloorData): string | null {
   if (!inb(startTx, startTy)) return "start out of bounds";
   const st = floor.tiles[idx(startTx, startTy)];
   if (st === Tile.Wall || st === Tile.Window || st === Tile.Sky || st === Tile.Door) return "start blocked";
+  if (floor.props.some(p=>p.solid&&startTx>=p.x&&startTx<p.x+p.w&&startTy>=p.y&&startTy<p.y+p.h)) return "start occupied by furniture";
   const geo = validateGeometry(floor);
   if (geo) return geo;
   const accessible = reachableTiles(floor, false);
@@ -1248,20 +1550,43 @@ export function validateFloor(floor: FloorData): string | null {
     const key = floor.props.find(p => p.id === floor.keyPropId && p.loot === "key");
     if (!key || !canSearchFrom(reachableTiles(floor, true), key)) return "cannot reach key before unlocking";
   }
-  return null;
+  return validateEnvironment(floor);
 }
 
-export function generateFloor(index: number, seed: number): FloorData {
-  for (let a = 0; a < 36; a++) {
+export function generateFloor(index: number, seed: number, runSeed?: number, generatorVersion = 2): FloorData {
+  const buildingSeed = runSeed ?? seed;
+  for (let a = 0; a < (generatorVersion === 1 ? 36 : 16); a++) {
     const s = (seed + a * 997) >>> 0;
     try {
-      const floor = index === 10 ? generateRoof(index, s) : buildFloor(index, s);
-      if (floor && !validateFloor(floor)) return floor;
+      const floor = index === 10 ? generateRoof(index, s) : generatorVersion === 1 ? buildFloor(index, s) : buildVariedFloor(index, s, buildingSeed);
+      if (!floor || validateFloor(floor)) continue;
+      if (index < 10) installVerticalRoutes(floor, buildingSeed);
+      populateEnvironment(floor);
+      if (index < 10) installVerticalQuests(floor, buildingSeed);
+      if (generatorVersion !== 1 && index < 10 && (!floor.environment?.features.some((f) => f.kind === "wall") || !floor.environment?.features.some((f) => f.kind === "obstruction"))) continue;
+      installTacticalContent(floor);
+      if (!validateFloor(floor)) return floor;
     } catch {
       // kolejna próba z innym ziarnem
     }
   }
-  return fallbackFloor(index, seed);
+  if (generatorVersion !== 1 && index < 10) {
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const legacy = buildFloor(index, (seed ^ 0x7583a1c3) + attempt * 997);
+      if (!legacy || validateFloor(legacy)) continue;
+      installVerticalRoutes(legacy, buildingSeed);
+      populateEnvironment(legacy);
+      installVerticalQuests(legacy, buildingSeed);
+      installTacticalContent(legacy);
+      if (!validateFloor(legacy)) return legacy;
+    }
+  }
+  const fallback = fallbackFloor(index, seed);
+  if (index < 10) installVerticalRoutes(fallback, buildingSeed);
+  populateEnvironment(fallback);
+  if (index < 10) installVerticalQuests(fallback, buildingSeed);
+  installTacticalContent(fallback);
+  return fallback;
 }
 
 function fallbackFloor(index: number, seed: number): FloorData {
